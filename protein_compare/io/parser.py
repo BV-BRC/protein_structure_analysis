@@ -219,3 +219,61 @@ class StructureLoader:
                 return "unknown"
 
         return "unknown"
+
+    @staticmethod
+    def detect_structure_type(structure: ProteinStructure) -> str:
+        """Detect whether structure is predicted or experimental.
+
+        Uses heuristics based on B-factor/pLDDT distribution:
+        - Predicted structures (AlphaFold, ESMFold): B-factor contains pLDDT (0-100)
+          with values typically clustered in specific ranges
+        - Experimental structures: B-factor contains temperature factors,
+          often with different distribution patterns
+
+        Args:
+            structure: ProteinStructure object.
+
+        Returns:
+            "predicted" or "experimental"
+        """
+        bfactors = structure.plddt  # stored in plddt field regardless of meaning
+
+        # Heuristics to distinguish predicted vs experimental:
+
+        # 1. Check if values are strictly within 0-100 (pLDDT range)
+        if np.any(bfactors < 0) or np.any(bfactors > 100):
+            return "experimental"  # B-factors can exceed 100
+
+        # 2. Predicted structures typically have pLDDT values with:
+        #    - Most values > 50 (confident regions)
+        #    - Values often clustered near 70-95
+        #    - Relatively discrete-looking distribution
+        mean_val = np.mean(bfactors)
+        std_val = np.std(bfactors)
+        min_val = np.min(bfactors)
+        max_val = np.max(bfactors)
+
+        # 3. Experimental B-factors typically:
+        #    - Have lower mean (often 15-40)
+        #    - Can have very low values near 0
+        #    - Often have values < 20 for well-ordered regions
+
+        # If mean is high (>50) and range is reasonable, likely predicted
+        if mean_val > 50 and max_val <= 100:
+            # Additional check: predicted structures rarely have very low values
+            low_value_fraction = np.sum(bfactors < 20) / len(bfactors)
+            if low_value_fraction < 0.1:  # Less than 10% below 20
+                return "predicted"
+
+        # If mean is low or many low values, likely experimental
+        if mean_val < 40:
+            return "experimental"
+
+        # Edge cases: check for characteristic predicted structure patterns
+        # pLDDT often has values clustered in 70-95 range
+        high_confidence_fraction = np.sum((bfactors >= 70) & (bfactors <= 100)) / len(bfactors)
+        if high_confidence_fraction > 0.5:
+            return "predicted"
+
+        # Default to experimental if uncertain
+        return "experimental"

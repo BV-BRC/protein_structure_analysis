@@ -1,0 +1,929 @@
+"""Structure characterization and report generation.
+
+Provides comprehensive analysis and visualization of a single protein structure,
+generating HTML and PDF reports with embedded figures.
+"""
+
+import base64
+from collections import Counter
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.figure import Figure
+import matplotlib.patches as mpatches
+
+from protein_compare.io.parser import ProteinStructure
+from protein_compare.core.confidence import ConfidenceAnalyzer, ConfidenceStats
+from protein_compare.core.contacts import ContactMapAnalyzer
+from protein_compare.core.secondary import SecondaryStructureAnalyzer
+
+
+# Amino acid properties for sequence analysis
+AA_PROPERTIES = {
+    "A": {"name": "Alanine", "mw": 89.1, "type": "hydrophobic"},
+    "C": {"name": "Cysteine", "mw": 121.2, "type": "polar"},
+    "D": {"name": "Aspartic acid", "mw": 133.1, "type": "negative"},
+    "E": {"name": "Glutamic acid", "mw": 147.1, "type": "negative"},
+    "F": {"name": "Phenylalanine", "mw": 165.2, "type": "hydrophobic"},
+    "G": {"name": "Glycine", "mw": 75.1, "type": "special"},
+    "H": {"name": "Histidine", "mw": 155.2, "type": "positive"},
+    "I": {"name": "Isoleucine", "mw": 131.2, "type": "hydrophobic"},
+    "K": {"name": "Lysine", "mw": 146.2, "type": "positive"},
+    "L": {"name": "Leucine", "mw": 131.2, "type": "hydrophobic"},
+    "M": {"name": "Methionine", "mw": 149.2, "type": "hydrophobic"},
+    "N": {"name": "Asparagine", "mw": 132.1, "type": "polar"},
+    "P": {"name": "Proline", "mw": 115.1, "type": "special"},
+    "Q": {"name": "Glutamine", "mw": 146.2, "type": "polar"},
+    "R": {"name": "Arginine", "mw": 174.2, "type": "positive"},
+    "S": {"name": "Serine", "mw": 105.1, "type": "polar"},
+    "T": {"name": "Threonine", "mw": 119.1, "type": "polar"},
+    "V": {"name": "Valine", "mw": 117.1, "type": "hydrophobic"},
+    "W": {"name": "Tryptophan", "mw": 204.2, "type": "hydrophobic"},
+    "Y": {"name": "Tyrosine", "mw": 181.2, "type": "polar"},
+    "X": {"name": "Unknown", "mw": 110.0, "type": "special"},
+}
+
+AA_TYPE_COLORS = {
+    "hydrophobic": "#FFA500",
+    "polar": "#32CD32",
+    "positive": "#4169E1",
+    "negative": "#DC143C",
+    "special": "#9370DB",
+}
+
+PLDDT_COLORS = {
+    "very_high": "#0053D6",
+    "confident": "#65CBF3",
+    "low": "#FFDB13",
+    "very_low": "#FF7D45",
+}
+
+# B-factor colors for experimental structures (lower = more ordered)
+BFACTOR_COLORS = {
+    "very_low": "#0053D6",    # Very ordered (B < 20)
+    "low": "#65CBF3",          # Ordered (20-40)
+    "medium": "#FFDB13",       # Moderate (40-60)
+    "high": "#FF7D45",         # Flexible (> 60)
+}
+
+SS_COLORS = {"H": "#E41A1C", "E": "#377EB8", "C": "#999999"}
+
+# Glossary of protein structure terms
+GLOSSARY = {
+    "pLDDT": {
+        "term": "pLDDT (predicted Local Distance Difference Test)",
+        "definition": "A per-residue confidence score (0-100) from structure prediction tools like AlphaFold and ESMFold. Indicates how confident the model is about the predicted position of each residue. Scores ≥90 are very high confidence, 70-90 are confident, 50-70 are low confidence, and <50 are very low confidence.",
+    },
+    "B-factor": {
+        "term": "B-factor (Temperature Factor)",
+        "definition": "In experimental structures, represents atomic displacement/flexibility. In predicted structures (AlphaFold, ESMFold), the B-factor column stores pLDDT confidence scores instead.",
+    },
+    "Contact Map": {
+        "term": "Contact Map",
+        "definition": "A 2D matrix showing which residue pairs are in spatial proximity (typically Cα-Cα distance < 8Å). Contacts near the diagonal are sequential neighbors; off-diagonal contacts indicate 3D folding bringing distant residues together.",
+    },
+    "Contact Order": {
+        "term": "Contact Order",
+        "definition": "The sequence separation between contacting residues. Short-range (<6 residues apart) contacts are local; long-range (>12 residues) contacts indicate complex folding topology.",
+    },
+    "Contact Density": {
+        "term": "Contact Density",
+        "definition": "The fraction of all possible residue pairs that are in contact. Higher density indicates a more compact, well-folded structure.",
+    },
+    "Secondary Structure": {
+        "term": "Secondary Structure",
+        "definition": "Local 3D arrangements of the protein backbone. The three main types are α-helix (H), β-sheet/strand (E), and coil/loop (C).",
+    },
+    "Alpha Helix": {
+        "term": "α-Helix (H)",
+        "definition": "A right-handed spiral structure stabilized by hydrogen bonds between backbone atoms (i to i+4). Common in many proteins, providing structural stability.",
+    },
+    "Beta Sheet": {
+        "term": "β-Sheet/Strand (E)",
+        "definition": "Extended chain conformations that form sheets through hydrogen bonds between adjacent strands. Can be parallel or antiparallel.",
+    },
+    "Coil": {
+        "term": "Coil/Loop (C)",
+        "definition": "Regions without regular secondary structure. Often flexible and found connecting helices and sheets. Includes turns, bends, and disordered regions.",
+    },
+    "DSSP": {
+        "term": "DSSP (Define Secondary Structure of Proteins)",
+        "definition": "Standard algorithm for assigning secondary structure from 3D coordinates based on hydrogen bonding patterns. Uses 8 states that are often simplified to 3 (H, E, C).",
+    },
+    "Cα (C-alpha)": {
+        "term": "Cα (Alpha Carbon)",
+        "definition": "The central carbon atom in each amino acid, bonded to the amino group, carboxyl group, hydrogen, and side chain. Cα positions define the protein backbone trace.",
+    },
+    "Cβ (C-beta)": {
+        "term": "Cβ (Beta Carbon)",
+        "definition": "The first carbon of the amino acid side chain, attached to Cα. All amino acids except glycine have a Cβ atom. Used in some structural analyses.",
+    },
+    "Residue": {
+        "term": "Residue",
+        "definition": "A single amino acid unit within a protein chain. Each residue has a backbone (N-Cα-C) and a side chain (R group) that determines its properties.",
+    },
+    "Molecular Weight": {
+        "term": "Molecular Weight (MW)",
+        "definition": "The total mass of the protein in Daltons (Da) or kiloDaltons (kDa). Calculated from the sum of amino acid masses minus water lost in peptide bond formation.",
+    },
+    "Hydrophobic": {
+        "term": "Hydrophobic Residues",
+        "definition": "Amino acids with non-polar side chains (A, V, L, I, M, F, W) that avoid water. Typically found in the protein core, driving protein folding.",
+    },
+    "Polar": {
+        "term": "Polar Residues",
+        "definition": "Amino acids with uncharged but polar side chains (S, T, N, Q, Y, C) that can form hydrogen bonds. Often found on protein surfaces.",
+    },
+    "Charged": {
+        "term": "Charged Residues",
+        "definition": "Amino acids with ionizable side chains. Positive: K, R, H (basic). Negative: D, E (acidic). Important for protein solubility and interactions.",
+    },
+    "TM-score": {
+        "term": "TM-score",
+        "definition": "Template Modeling score (0-1) measuring structural similarity between proteins, normalized by protein length. TM-score >0.5 indicates the same fold; >0.17 is typically significant.",
+    },
+    "RMSD": {
+        "term": "RMSD (Root Mean Square Deviation)",
+        "definition": "A measure of average distance between aligned atoms (usually Cα) in Ångströms. Lower RMSD means more similar structures. Depends on alignment length.",
+    },
+    "Ångström": {
+        "term": "Ångström (Å)",
+        "definition": "Unit of length equal to 10⁻¹⁰ meters (0.1 nanometers). Standard unit for atomic distances. A typical C-C bond is ~1.5Å; contact distance cutoff is typically 8Å.",
+    },
+}
+
+
+@dataclass
+class SequenceComposition:
+    """Sequence composition analysis results."""
+    length: int
+    aa_counts: dict
+    aa_fractions: dict
+    molecular_weight: float
+    type_counts: dict
+    type_fractions: dict
+    chains: list
+
+
+@dataclass
+class ContactAnalysis:
+    """Contact map analysis results."""
+    contact_map: np.ndarray
+    n_contacts: int
+    contact_density: float
+    n_short_range: int
+    n_medium_range: int
+    n_long_range: int
+    n_very_long_range: int
+    contacts_per_residue: np.ndarray
+
+
+@dataclass
+class SSAnalysis:
+    """Secondary structure analysis results."""
+    ss_sequence: list
+    helix_fraction: float
+    sheet_fraction: float
+    coil_fraction: float
+    helix_count: int
+    sheet_count: int
+    coil_count: int
+
+
+class StructureCharacterizer:
+    """Generate comprehensive characterization of a single protein structure."""
+
+    def __init__(
+        self,
+        structure: ProteinStructure,
+        contact_cutoff: float = 8.0,
+        dpi: int = 150,
+        structure_type: Optional[str] = None,
+    ):
+        """Initialize the characterizer.
+
+        Args:
+            structure: ProteinStructure to characterize.
+            contact_cutoff: Distance cutoff for contacts in Ångströms.
+            dpi: Resolution for generated figures.
+            structure_type: "predicted" or "experimental". If None, auto-detects.
+        """
+        self.structure = structure
+        self.contact_cutoff = contact_cutoff
+        self.dpi = dpi
+
+        # Auto-detect or use provided structure type
+        if structure_type is None:
+            from protein_compare.io.parser import StructureLoader
+            self.structure_type = StructureLoader.detect_structure_type(structure)
+        else:
+            self.structure_type = structure_type
+
+        self.is_predicted = self.structure_type == "predicted"
+
+        self.confidence_analyzer = ConfidenceAnalyzer()
+        self.contact_analyzer = ContactMapAnalyzer(cutoff=contact_cutoff)
+        self.ss_analyzer = SecondaryStructureAnalyzer()
+        self._seq_comp: Optional[SequenceComposition] = None
+        self._conf_stats: Optional[ConfidenceStats] = None
+        self._contact_analysis: Optional[ContactAnalysis] = None
+        self._ss_analysis: Optional[SSAnalysis] = None
+
+    def analyze_sequence_composition(self) -> SequenceComposition:
+        """Analyze amino acid composition."""
+        if self._seq_comp is not None:
+            return self._seq_comp
+        seq = self.structure.sequence
+        length = len(seq)
+        aa_counts = dict(Counter(seq))
+        aa_fractions = {aa: c / length for aa, c in aa_counts.items()}
+        mw = sum(AA_PROPERTIES.get(aa, AA_PROPERTIES["X"])["mw"] for aa in seq) - 18.015 * (length - 1)
+        type_counts = {"hydrophobic": 0, "polar": 0, "positive": 0, "negative": 0, "special": 0}
+        for aa in seq:
+            t = AA_PROPERTIES.get(aa, AA_PROPERTIES["X"])["type"]
+            type_counts[t] = type_counts.get(t, 0) + 1
+        type_fractions = {t: c / length for t, c in type_counts.items()}
+        chains = list(set(rid[0] for rid in self.structure.residue_ids))
+        self._seq_comp = SequenceComposition(length, aa_counts, aa_fractions, mw, type_counts, type_fractions, chains)
+        return self._seq_comp
+
+    def analyze_confidence(self) -> ConfidenceStats:
+        """Analyze pLDDT confidence scores."""
+        if self._conf_stats is not None:
+            return self._conf_stats
+        self._conf_stats = self.confidence_analyzer.compute_stats(self.structure.plddt)
+        return self._conf_stats
+
+    def analyze_contacts(self) -> ContactAnalysis:
+        """Analyze contact map."""
+        if self._contact_analysis is not None:
+            return self._contact_analysis
+        cmap = self.contact_analyzer.compute_contact_map(self.structure)
+        n = len(cmap)
+        n_contacts = int(np.sum(np.triu(cmap, k=1)))
+        max_c = n * (n - 1) // 2
+        density = n_contacts / max_c if max_c > 0 else 0
+        n_short = n_medium = n_long = n_vlong = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cmap[i, j]:
+                    sep = j - i
+                    if sep < 6: n_short += 1
+                    elif sep < 12: n_medium += 1
+                    elif sep < 24: n_long += 1
+                    else: n_vlong += 1
+        cpr = np.sum(cmap, axis=1)
+        self._contact_analysis = ContactAnalysis(cmap, n_contacts, density, n_short, n_medium, n_long, n_vlong, cpr)
+        return self._contact_analysis
+
+    def analyze_secondary_structure(self) -> SSAnalysis:
+        """Analyze secondary structure."""
+        if self._ss_analysis is not None:
+            return self._ss_analysis
+        try:
+            ss_seq = self.ss_analyzer.assign_ss(self.structure, simplify=True)
+        except Exception:
+            ss_seq = ["C"] * self.structure.n_residues
+        n = len(ss_seq)
+        h, e, c = ss_seq.count("H"), ss_seq.count("E"), ss_seq.count("C")
+        self._ss_analysis = SSAnalysis(ss_seq, h/n if n else 0, e/n if n else 0, c/n if n else 0, h, e, c)
+        return self._ss_analysis
+
+    def _get_bfactor_color(self, val: float) -> str:
+        """Get color for B-factor value (experimental structures)."""
+        if val < 20: return BFACTOR_COLORS["very_low"]
+        if val < 40: return BFACTOR_COLORS["low"]
+        if val < 60: return BFACTOR_COLORS["medium"]
+        return BFACTOR_COLORS["high"]
+
+    def _get_plddt_color(self, val: float) -> str:
+        """Get color for pLDDT value (predicted structures)."""
+        if val >= 90: return PLDDT_COLORS["very_high"]
+        if val >= 70: return PLDDT_COLORS["confident"]
+        if val >= 50: return PLDDT_COLORS["low"]
+        return PLDDT_COLORS["very_low"]
+
+    def _get_value_color(self, val: float) -> str:
+        """Get color based on structure type."""
+        if self.is_predicted:
+            return self._get_plddt_color(val)
+        else:
+            return self._get_bfactor_color(val)
+
+    def plot_plddt_distribution(self) -> Figure:
+        """Plot pLDDT/B-factor score distribution histogram."""
+        fig, ax = plt.subplots(figsize=(8, 5))
+        values = self.structure.plddt
+        stats = self.analyze_confidence()
+
+        if self.is_predicted:
+            # pLDDT mode (predicted structures)
+            bins = np.arange(0, 105, 5)
+            n, _, patches = ax.hist(values, bins=bins, edgecolor="white", linewidth=0.5)
+            for i, patch in enumerate(patches):
+                bc = (bins[i] + bins[i + 1]) / 2
+                patch.set_facecolor(self._get_plddt_color(bc))
+            for thresh in [50, 70, 90]:
+                ax.axvline(thresh, color="gray", linestyle="--", linewidth=1, alpha=0.7)
+            txt = f"Mean: {stats.mean:.1f}\nMedian: {stats.median:.1f}\nHigh conf: {stats.frac_confident:.1%}"
+            ax.text(0.02, 0.98, txt, transform=ax.transAxes, fontsize=10, va="top",
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+            ax.set_xlabel("pLDDT Score")
+            ax.set_title("pLDDT Score Distribution")
+            ax.set_xlim(0, 100)
+            legend_patches = [
+                mpatches.Patch(color=PLDDT_COLORS["very_high"], label="Very High (≥90)"),
+                mpatches.Patch(color=PLDDT_COLORS["confident"], label="Confident (70-90)"),
+                mpatches.Patch(color=PLDDT_COLORS["low"], label="Low (50-70)"),
+                mpatches.Patch(color=PLDDT_COLORS["very_low"], label="Very Low (<50)"),
+            ]
+        else:
+            # B-factor mode (experimental structures)
+            max_val = max(100, np.max(values) * 1.1)
+            bins = np.arange(0, max_val + 5, 5)
+            n, _, patches = ax.hist(values, bins=bins, edgecolor="white", linewidth=0.5)
+            for i, patch in enumerate(patches):
+                bc = (bins[i] + bins[i + 1]) / 2
+                patch.set_facecolor(self._get_bfactor_color(bc))
+            for thresh in [20, 40, 60]:
+                ax.axvline(thresh, color="gray", linestyle="--", linewidth=1, alpha=0.7)
+            low_mobility = np.sum(values < 30) / len(values)
+            txt = f"Mean: {stats.mean:.1f} Ų\nMedian: {stats.median:.1f} Ų\nOrdered (<30): {low_mobility:.1%}"
+            ax.text(0.02, 0.98, txt, transform=ax.transAxes, fontsize=10, va="top",
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+            ax.set_xlabel("B-factor (Ų)")
+            ax.set_title("B-factor Distribution")
+            ax.set_xlim(0, max_val)
+            legend_patches = [
+                mpatches.Patch(color=BFACTOR_COLORS["very_low"], label="Very Ordered (<20)"),
+                mpatches.Patch(color=BFACTOR_COLORS["low"], label="Ordered (20-40)"),
+                mpatches.Patch(color=BFACTOR_COLORS["medium"], label="Moderate (40-60)"),
+                mpatches.Patch(color=BFACTOR_COLORS["high"], label="Flexible (>60)"),
+            ]
+
+        ax.set_ylabel("Number of Residues")
+        ax.legend(handles=legend_patches, loc="upper right", fontsize=9)
+        fig.tight_layout()
+        return fig
+
+    def plot_plddt_profile(self) -> Figure:
+        """Plot per-residue pLDDT/B-factor profile."""
+        fig, ax = plt.subplots(figsize=(12, 4))
+        values = self.structure.plddt
+        res = np.arange(1, len(values) + 1)
+
+        if self.is_predicted:
+            # pLDDT mode
+            ax.axhspan(0, 50, alpha=0.1, color=PLDDT_COLORS["very_low"])
+            ax.axhspan(50, 70, alpha=0.1, color=PLDDT_COLORS["low"])
+            ax.axhspan(70, 90, alpha=0.1, color=PLDDT_COLORS["confident"])
+            ax.axhspan(90, 100, alpha=0.1, color=PLDDT_COLORS["very_high"])
+            colors = [self._get_plddt_color(p) for p in values]
+            ax.scatter(res, values, c=colors, s=10, zorder=3)
+            ax.plot(res, values, color="gray", linewidth=0.5, alpha=0.5)
+            for thresh in [50, 70, 90]:
+                ax.axhline(thresh, color="gray", linestyle="--", linewidth=0.5, alpha=0.5)
+            ax.set_ylabel("pLDDT Score")
+            ax.set_title("Per-Residue pLDDT Profile")
+            ax.set_ylim(0, 100)
+        else:
+            # B-factor mode
+            max_val = max(80, np.max(values) * 1.1)
+            ax.axhspan(0, 20, alpha=0.1, color=BFACTOR_COLORS["very_low"])
+            ax.axhspan(20, 40, alpha=0.1, color=BFACTOR_COLORS["low"])
+            ax.axhspan(40, 60, alpha=0.1, color=BFACTOR_COLORS["medium"])
+            ax.axhspan(60, max_val, alpha=0.1, color=BFACTOR_COLORS["high"])
+            colors = [self._get_bfactor_color(b) for b in values]
+            ax.scatter(res, values, c=colors, s=10, zorder=3)
+            ax.plot(res, values, color="gray", linewidth=0.5, alpha=0.5)
+            for thresh in [20, 40, 60]:
+                ax.axhline(thresh, color="gray", linestyle="--", linewidth=0.5, alpha=0.5)
+            ax.set_ylabel("B-factor (Ų)")
+            ax.set_title("Per-Residue B-factor Profile")
+            ax.set_ylim(0, max_val)
+
+        ax.set_xlabel("Residue Number")
+        ax.set_xlim(1, len(values))
+        fig.tight_layout()
+        return fig
+
+    def plot_contact_map(self) -> Figure:
+        """Plot contact map heatmap."""
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ca = self.analyze_contacts()
+        im = ax.imshow(ca.contact_map, cmap="Blues", origin="lower", aspect="equal")
+        plt.colorbar(im, ax=ax, shrink=0.8, label="Contact")
+        n = len(ca.contact_map)
+        ax.plot([0, n-1], [0, n-1], "k--", linewidth=0.5, alpha=0.5)
+        txt = f"Contacts: {ca.n_contacts}\nDensity: {ca.contact_density:.3f}"
+        ax.text(0.02, 0.98, txt, transform=ax.transAxes, fontsize=10, va="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+        ax.set_xlabel("Residue Number"); ax.set_ylabel("Residue Number")
+        ax.set_title(f"Contact Map (cutoff: {self.contact_cutoff} Å)")
+        fig.tight_layout()
+        return fig
+
+    def plot_contact_order(self) -> Figure:
+        """Plot contact order distribution."""
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ca = self.analyze_contacts()
+        cats = ["Short\n(<6)", "Medium\n(6-12)", "Long\n(12-24)", "Very Long\n(>24)"]
+        counts = [ca.n_short_range, ca.n_medium_range, ca.n_long_range, ca.n_very_long_range]
+        colors = ["#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3"]
+        bars = ax.bar(cats, counts, color=colors, edgecolor="white")
+        for bar, cnt in zip(bars, counts):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5, str(cnt), ha="center", fontsize=11)
+        ax.set_xlabel("Sequence Separation"); ax.set_ylabel("Number of Contacts")
+        ax.set_title("Contact Order Distribution")
+        ax.text(0.98, 0.98, f"Total: {ca.n_contacts}", transform=ax.transAxes, ha="right", va="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+        fig.tight_layout()
+        return fig
+
+    def plot_residue_contacts(self) -> Figure:
+        """Plot contacts per residue."""
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ca = self.analyze_contacts()
+        res = np.arange(1, len(ca.contacts_per_residue) + 1)
+        ax.bar(res, ca.contacts_per_residue, color="#377eb8", width=1.0)
+        mean_c = np.mean(ca.contacts_per_residue)
+        ax.axhline(mean_c, color="red", linestyle="--", label=f"Mean: {mean_c:.1f}")
+        ax.set_xlabel("Residue Number"); ax.set_ylabel("Number of Contacts")
+        ax.set_title("Contacts Per Residue"); ax.set_xlim(1, len(ca.contacts_per_residue))
+        ax.legend(loc="upper right")
+        fig.tight_layout()
+        return fig
+
+    def plot_aa_composition(self) -> Figure:
+        """Plot amino acid composition."""
+        fig, ax = plt.subplots(figsize=(12, 5))
+        comp = self.analyze_sequence_composition()
+        aa_order = ["A","V","L","I","M","F","W","S","T","N","Q","Y","C","K","R","H","D","E","G","P"]
+        fracs = [comp.aa_fractions.get(aa, 0) * 100 for aa in aa_order]
+        colors = [AA_TYPE_COLORS[AA_PROPERTIES[aa]["type"]] for aa in aa_order]
+        ax.bar(aa_order, fracs, color=colors, edgecolor="white", linewidth=0.5)
+        ax.axhline(5, color="gray", linestyle="--", alpha=0.7, label="Expected (5%)")
+        ax.set_xlabel("Amino Acid"); ax.set_ylabel("Frequency (%)")
+        ax.set_title("Amino Acid Composition")
+        legend_patches = [mpatches.Patch(color=c, label=t.title()) for t, c in AA_TYPE_COLORS.items()]
+        ax.legend(handles=legend_patches, loc="upper right", fontsize=9)
+        fig.tight_layout()
+        return fig
+
+    def plot_ss_composition(self) -> Figure:
+        """Plot secondary structure composition."""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        ss = self.analyze_secondary_structure()
+        sizes = [ss.helix_fraction, ss.sheet_fraction, ss.coil_fraction]
+        labels, colors = ["Helix", "Sheet", "Coil"], [SS_COLORS["H"], SS_COLORS["E"], SS_COLORS["C"]]
+        non_zero = [(s, l, c) for s, l, c in zip(sizes, labels, colors) if s > 0]
+        if non_zero:
+            sz, lb, cl = zip(*non_zero)
+            ax1.pie(sz, labels=lb, colors=cl, autopct="%1.1f%%", startangle=90)
+        ax1.set_title("Secondary Structure Content")
+        counts = [ss.helix_count, ss.sheet_count, ss.coil_count]
+        bars = ax2.bar(labels, counts, color=[SS_COLORS["H"], SS_COLORS["E"], SS_COLORS["C"]])
+        for bar, cnt in zip(bars, counts):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5, str(cnt), ha="center")
+        ax2.set_xlabel("Secondary Structure"); ax2.set_ylabel("Residues")
+        ax2.set_title("Residue Counts by SS Type")
+        fig.tight_layout()
+        return fig
+
+    def plot_ss_profile(self) -> Figure:
+        """Plot secondary structure along sequence."""
+        fig, ax = plt.subplots(figsize=(12, 2))
+        ss = self.analyze_secondary_structure()
+        for i, s in enumerate(ss.ss_sequence):
+            ax.bar(i + 1, 1, color=SS_COLORS.get(s, SS_COLORS["C"]), width=1.0, edgecolor="none")
+        ax.set_xlim(0.5, len(ss.ss_sequence) + 0.5); ax.set_ylim(0, 1)
+        ax.set_xlabel("Residue Number"); ax.set_yticks([])
+        ax.set_title("Secondary Structure Profile")
+        legend_patches = [mpatches.Patch(color=SS_COLORS[k], label=l) for k, l in [("H","Helix"),("E","Sheet"),("C","Coil")]]
+        ax.legend(handles=legend_patches, loc="upper right", ncol=3)
+        fig.tight_layout()
+        return fig
+
+    def _fig_to_base64(self, fig: Figure) -> str:
+        """Convert figure to base64 PNG string."""
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=self.dpi, bbox_inches="tight")
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("utf-8")
+
+    def generate_all_figures(self) -> dict:
+        """Generate all characterization figures."""
+        return {
+            "plddt_distribution": self.plot_plddt_distribution(),
+            "plddt_profile": self.plot_plddt_profile(),
+            "contact_map": self.plot_contact_map(),
+            "contact_order": self.plot_contact_order(),
+            "residue_contacts": self.plot_residue_contacts(),
+            "aa_composition": self.plot_aa_composition(),
+            "ss_composition": self.plot_ss_composition(),
+            "ss_profile": self.plot_ss_profile(),
+        }
+
+    def generate_html_report(self, output_path: str) -> None:
+        """Generate self-contained HTML report with embedded images."""
+        seq_comp = self.analyze_sequence_composition()
+        conf_stats = self.analyze_confidence()
+        contact_analysis = self.analyze_contacts()
+        ss_analysis = self.analyze_secondary_structure()
+        figures = self.generate_all_figures()
+        images_b64 = {name: self._fig_to_base64(fig) for name, fig in figures.items()}
+        for fig in figures.values():
+            plt.close(fig)
+        # Read PDB content for 3D viewer
+        pdb_content = ""
+        if self.structure.source_path and self.structure.source_path.exists():
+            pdb_content = self.structure.source_path.read_text()
+        html = self._build_html(seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, pdb_content)
+        Path(output_path).write_text(html)
+
+    def generate_pdf_report(self, output_path: str) -> None:
+        """Generate PDF report with all figures."""
+        seq_comp = self.analyze_sequence_composition()
+        conf_stats = self.analyze_confidence()
+        contact_analysis = self.analyze_contacts()
+        ss_analysis = self.analyze_secondary_structure()
+        with PdfPages(output_path) as pdf:
+            fig = self._create_summary_page(seq_comp, conf_stats, contact_analysis, ss_analysis)
+            pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+            for plot_fn in [self.plot_aa_composition, self.plot_plddt_distribution, self.plot_plddt_profile,
+                            self.plot_contact_map, self.plot_contact_order, self.plot_residue_contacts,
+                            self.plot_ss_composition, self.plot_ss_profile]:
+                fig = plot_fn()
+                pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+            # Add glossary pages
+            glossary_figs = self._create_glossary_pages()
+            for fig in glossary_figs:
+                pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    def _create_summary_page(self, seq_comp, conf_stats, contact_analysis, ss_analysis) -> Figure:
+        """Create summary page for PDF."""
+        fig, ax = plt.subplots(figsize=(8.5, 11))
+        ax.axis("off")
+        ax.text(0.5, 0.95, "Structure Characterization Report", fontsize=20, ha="center", fontweight="bold")
+        ax.text(0.5, 0.90, self.structure.name, fontsize=16, ha="center", style="italic")
+
+        # Structure-type-specific labels
+        if self.is_predicted:
+            score_name = "pLDDT"
+            section_name = "CONFIDENCE ANALYSIS"
+            high_label = "Very High (≥90)"
+            low_label = "Very Low (<50)"
+            high_value = conf_stats.n_very_high
+            low_value = conf_stats.n_very_low
+        else:
+            score_name = "B-factor"
+            section_name = "B-FACTOR ANALYSIS"
+            high_label = "Flexible (>60)"
+            low_label = "Ordered (<20)"
+            high_value = int(np.sum(self.structure.plddt > 60))
+            low_value = int(np.sum(self.structure.plddt < 20))
+
+        lines = [
+            "", "=" * 50, "BASIC INFORMATION", "=" * 50,
+            f"Structure Name:     {self.structure.name}",
+            f"Number of Residues: {seq_comp.length}",
+            f"Chain(s):           {', '.join(seq_comp.chains)}",
+            f"Molecular Weight:   {seq_comp.molecular_weight/1000:.1f} kDa",
+            f"Structure Type:     {self.structure_type.title()}",
+            "", "=" * 50, section_name, "=" * 50,
+            f"Mean {score_name}:         {conf_stats.mean:.1f}",
+            f"Median {score_name}:       {conf_stats.median:.1f}",
+            f"High Confidence:    {conf_stats.frac_confident:.1%}" if self.is_predicted else f"Ordered (<30):      {np.sum(self.structure.plddt < 30) / len(self.structure.plddt):.1%}",
+            f"{high_label}:    {high_value} residues",
+            f"{low_label}:     {low_value} residues",
+            "", "=" * 50, "CONTACT ANALYSIS", "=" * 50,
+            f"Total Contacts:     {contact_analysis.n_contacts}",
+            f"Contact Density:    {contact_analysis.contact_density:.3f}",
+            f"Long-range (>12):   {contact_analysis.n_long_range + contact_analysis.n_very_long_range}",
+            "", "=" * 50, "SECONDARY STRUCTURE", "=" * 50,
+            f"Helix:              {ss_analysis.helix_fraction:.1%} ({ss_analysis.helix_count} residues)",
+            f"Sheet:              {ss_analysis.sheet_fraction:.1%} ({ss_analysis.sheet_count} residues)",
+            f"Coil:               {ss_analysis.coil_fraction:.1%} ({ss_analysis.coil_count} residues)",
+            "", "=" * 50, "SEQUENCE COMPOSITION", "=" * 50,
+            f"Hydrophobic:        {seq_comp.type_fractions.get('hydrophobic', 0):.1%}",
+            f"Polar:              {seq_comp.type_fractions.get('polar', 0):.1%}",
+            f"Charged (+):        {seq_comp.type_fractions.get('positive', 0):.1%}",
+            f"Charged (-):        {seq_comp.type_fractions.get('negative', 0):.1%}",
+        ]
+        ax.text(0.1, 0.85, "\n".join(lines), fontsize=10, ha="left", va="top", family="monospace", transform=ax.transAxes)
+        return fig
+
+    def _build_html(self, seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, pdb_content="") -> str:
+        """Build HTML report string."""
+        # Escape PDB content for JavaScript
+        pdb_escaped = pdb_content.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$") if pdb_content else ""
+
+        # Structure-type-specific labels and thresholds
+        if self.is_predicted:
+            score_name = "pLDDT"
+            score_unit = ""
+            section_title = "Confidence Analysis (pLDDT)"
+            mean_label = "Mean pLDDT"
+            median_label = "Median pLDDT"
+            high_label = "Very High (≥90)"
+            low_label = "Very Low (<50)"
+            high_value = conf_stats.n_very_high
+            low_value = conf_stats.n_very_low
+            highlight_class = "highlight" if conf_stats.mean >= 70 else ("warning" if conf_stats.mean >= 50 else "")
+            summary_quality_label = "High Confidence"
+            summary_quality_value = f"{conf_stats.frac_confident:.0%}"
+            dist_caption = "Distribution of pLDDT confidence scores"
+            profile_caption = "Per-residue pLDDT profile"
+            color_btn_label = "Color by pLDDT"
+        else:
+            score_name = "B-factor"
+            score_unit = " Ų"
+            section_title = "B-factor Analysis (Flexibility)"
+            mean_label = "Mean B-factor"
+            median_label = "Median B-factor"
+            high_label = "Flexible (>60)"
+            low_label = "Ordered (<20)"
+            # For B-factors, "high" means flexible (high B), "low" means ordered (low B)
+            high_value = int(np.sum(self.structure.plddt > 60))
+            low_value = int(np.sum(self.structure.plddt < 20))
+            # For B-factors, lower is better (more ordered)
+            highlight_class = "highlight" if conf_stats.mean < 30 else ("warning" if conf_stats.mean < 50 else "")
+            summary_quality_label = "Ordered (<30)"
+            ordered_frac = np.sum(self.structure.plddt < 30) / len(self.structure.plddt)
+            summary_quality_value = f"{ordered_frac:.0%}"
+            dist_caption = "Distribution of B-factor (atomic displacement) values"
+            profile_caption = "Per-residue B-factor profile"
+            color_btn_label = "Color by B-factor"
+
+        return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Structure Characterization: {self.structure.name}</title>
+    <script src="https://3dmol.org/build/3Dmol-min.js"></script>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }}
+        h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
+        h2 {{ color: #2c3e50; border-bottom: 2px solid #bdc3c7; padding-bottom: 8px; margin-top: 30px; }}
+        .section {{ background: white; padding: 20px; margin: 20px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .metrics-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin: 15px 0; }}
+        .metric-box {{ background: #ecf0f1; padding: 15px; border-radius: 6px; text-align: center; }}
+        .metric-box.highlight {{ background: #d5f4e6; }}
+        .metric-box.warning {{ background: #ffeaa7; }}
+        .metric-value {{ font-size: 24px; font-weight: bold; color: #2c3e50; }}
+        .metric-label {{ font-size: 12px; color: #7f8c8d; text-transform: uppercase; }}
+        .figure {{ text-align: center; margin: 20px 0; }}
+        .figure img {{ max-width: 100%; height: auto; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .figure-caption {{ font-style: italic; color: #666; margin-top: 8px; }}
+        .sequence {{ font-family: monospace; font-size: 12px; word-break: break-all; background: #f8f9fa; padding: 10px; border-radius: 4px; max-height: 150px; overflow-y: auto; }}
+        .footer {{ text-align: center; color: #999; font-size: 12px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; }}
+        .glossary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 15px; }}
+        .glossary-item {{ background: #f8f9fa; padding: 12px 15px; border-radius: 6px; border-left: 4px solid #3498db; }}
+        .glossary-term {{ font-weight: bold; color: #2c3e50; margin-bottom: 5px; }}
+        .glossary-def {{ font-size: 13px; color: #555; line-height: 1.5; }}
+        #viewer-container {{ width: 100%; height: 500px; position: relative; border-radius: 8px; overflow: hidden; }}
+        #viewer {{ width: 100%; height: 100%; }}
+        .viewer-controls {{ display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; justify-content: center; }}
+        .viewer-controls button {{ padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; transition: background 0.2s; }}
+        .viewer-controls button {{ background: #3498db; color: white; }}
+        .viewer-controls button:hover {{ background: #2980b9; }}
+        .viewer-controls button.active {{ background: #2c3e50; }}
+    </style>
+</head>
+<body>
+    <h1>Structure Characterization Report</h1>
+    <p style="font-size: 18px; color: #666;"><strong>{self.structure.name}</strong></p>
+
+    <div class="section" id="structure-viewer">
+        <h2>3D Structure</h2>
+        <div id="viewer-container">
+            <div id="viewer"></div>
+        </div>
+        <div class="viewer-controls">
+            <button onclick="setStyle('cartoon')" id="btn-cartoon" class="active">Cartoon</button>
+            <button onclick="setStyle('stick')" id="btn-stick">Sticks</button>
+            <button onclick="setStyle('sphere')" id="btn-sphere">Spheres</button>
+            <button onclick="setStyle('line')" id="btn-line">Lines</button>
+            <button onclick="colorBy('ss')" id="btn-ss">Color by SS</button>
+            <button onclick="colorBy('bfactor')" id="btn-bfactor">{color_btn_label}</button>
+            <button onclick="colorBy('chain')" id="btn-chain">Color by Chain</button>
+            <button onclick="viewer.spin(spinning = !spinning)" id="btn-spin">Spin</button>
+            <button onclick="viewer.zoomTo(); viewer.render();">Reset View</button>
+        </div>
+        <div class="figure-caption">Interactive 3D viewer. Drag to rotate, scroll to zoom, right-click drag to translate.</div>
+    </div>
+
+    <div class="section" id="summary"><h2>Summary</h2>
+        <div class="metrics-grid">
+            <div class="metric-box"><div class="metric-value">{seq_comp.length}</div><div class="metric-label">Residues</div></div>
+            <div class="metric-box"><div class="metric-value">{seq_comp.molecular_weight/1000:.1f} kDa</div><div class="metric-label">Molecular Weight</div></div>
+            <div class="metric-box {highlight_class}"><div class="metric-value">{conf_stats.mean:.1f}{score_unit}</div><div class="metric-label">{mean_label}</div></div>
+            <div class="metric-box highlight"><div class="metric-value">{summary_quality_value}</div><div class="metric-label">{summary_quality_label}</div></div>
+            <div class="metric-box"><div class="metric-value">{contact_analysis.n_contacts}</div><div class="metric-label">Contacts</div></div>
+            <div class="metric-box"><div class="metric-value">{ss_analysis.helix_fraction:.0%}/{ss_analysis.sheet_fraction:.0%}</div><div class="metric-label">Helix/Sheet</div></div>
+        </div>
+    </div>
+    <div class="section" id="sequence"><h2>Sequence Analysis</h2>
+        <div class="metrics-grid">
+            <div class="metric-box"><div class="metric-value">{seq_comp.type_fractions.get("hydrophobic", 0):.0%}</div><div class="metric-label">Hydrophobic</div></div>
+            <div class="metric-box"><div class="metric-value">{seq_comp.type_fractions.get("polar", 0):.0%}</div><div class="metric-label">Polar</div></div>
+            <div class="metric-box"><div class="metric-value">{seq_comp.type_fractions.get("positive", 0):.0%}</div><div class="metric-label">Positive (+)</div></div>
+            <div class="metric-box"><div class="metric-value">{seq_comp.type_fractions.get("negative", 0):.0%}</div><div class="metric-label">Negative (-)</div></div>
+        </div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["aa_composition"]}" alt="AA Composition"><div class="figure-caption">Amino acid composition by residue type</div></div>
+        <h3>Sequence</h3><div class="sequence">{self.structure.sequence}</div>
+    </div>
+    <div class="section" id="confidence"><h2>{section_title}</h2>
+        <div class="metrics-grid">
+            <div class="metric-box"><div class="metric-value">{conf_stats.mean:.1f}{score_unit}</div><div class="metric-label">{mean_label}</div></div>
+            <div class="metric-box"><div class="metric-value">{conf_stats.median:.1f}{score_unit}</div><div class="metric-label">{median_label}</div></div>
+            <div class="metric-box"><div class="metric-value">{high_value}</div><div class="metric-label">{high_label}</div></div>
+            <div class="metric-box"><div class="metric-value">{low_value}</div><div class="metric-label">{low_label}</div></div>
+        </div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["plddt_distribution"]}" alt="{score_name} Distribution"><div class="figure-caption">{dist_caption}</div></div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["plddt_profile"]}" alt="{score_name} Profile"><div class="figure-caption">{profile_caption}</div></div>
+    </div>
+    <div class="section" id="contacts"><h2>Contact Analysis</h2>
+        <div class="metrics-grid">
+            <div class="metric-box"><div class="metric-value">{contact_analysis.n_contacts}</div><div class="metric-label">Total Contacts</div></div>
+            <div class="metric-box"><div class="metric-value">{contact_analysis.contact_density:.3f}</div><div class="metric-label">Contact Density</div></div>
+            <div class="metric-box"><div class="metric-value">{contact_analysis.n_long_range + contact_analysis.n_very_long_range}</div><div class="metric-label">Long-Range (&gt;12)</div></div>
+            <div class="metric-box"><div class="metric-value">{self.contact_cutoff} Å</div><div class="metric-label">Cutoff Distance</div></div>
+        </div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["contact_map"]}" alt="Contact Map"><div class="figure-caption">Contact map (Cα-Cα distance &lt; {self.contact_cutoff} Å)</div></div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["contact_order"]}" alt="Contact Order"><div class="figure-caption">Contact order distribution</div></div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["residue_contacts"]}" alt="Residue Contacts"><div class="figure-caption">Contacts per residue</div></div>
+    </div>
+    <div class="section" id="secondary"><h2>Secondary Structure</h2>
+        <div class="metrics-grid">
+            <div class="metric-box"><div class="metric-value">{ss_analysis.helix_fraction:.1%}</div><div class="metric-label">Helix ({ss_analysis.helix_count} res)</div></div>
+            <div class="metric-box"><div class="metric-value">{ss_analysis.sheet_fraction:.1%}</div><div class="metric-label">Sheet ({ss_analysis.sheet_count} res)</div></div>
+            <div class="metric-box"><div class="metric-value">{ss_analysis.coil_fraction:.1%}</div><div class="metric-label">Coil ({ss_analysis.coil_count} res)</div></div>
+        </div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["ss_composition"]}" alt="SS Composition"><div class="figure-caption">Secondary structure composition</div></div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["ss_profile"]}" alt="SS Profile"><div class="figure-caption">Secondary structure profile</div></div>
+    </div>
+
+    <div class="section" id="glossary">
+        <h2>Glossary of Terms</h2>
+        <div class="glossary-grid">
+            {self._build_glossary_html()}
+        </div>
+    </div>
+    <div class="footer">Generated by protein_compare v0.1.0</div>
+
+    <script>
+        let viewer = null;
+        let spinning = false;
+        let currentStyle = 'cartoon';
+        let currentColor = 'ss';
+
+        const pdbData = `{pdb_escaped}`;
+
+        document.addEventListener('DOMContentLoaded', function() {{
+            if (pdbData.trim()) {{
+                let element = document.getElementById('viewer');
+                let config = {{ backgroundColor: 'white' }};
+                viewer = $3Dmol.createViewer(element, config);
+                viewer.addModel(pdbData, 'pdb');
+                applyStyle();
+                viewer.zoomTo();
+                viewer.render();
+            }} else {{
+                document.getElementById('viewer-container').innerHTML = '<p style="text-align:center;padding:50px;color:#999;">PDB data not available</p>';
+            }}
+        }});
+
+        function setStyle(style) {{
+            currentStyle = style;
+            document.querySelectorAll('.viewer-controls button').forEach(b => b.classList.remove('active'));
+            document.getElementById('btn-' + style).classList.add('active');
+            applyStyle();
+        }}
+
+        function colorBy(scheme) {{
+            currentColor = scheme;
+            applyStyle();
+        }}
+
+        function applyStyle() {{
+            if (!viewer) return;
+            viewer.setStyle({{}}, {{}});
+
+            let styleSpec = {{}};
+            if (currentStyle === 'cartoon') {{
+                styleSpec = {{ cartoon: {{ color: 'spectrum' }} }};
+            }} else if (currentStyle === 'stick') {{
+                styleSpec = {{ stick: {{ radius: 0.15 }} }};
+            }} else if (currentStyle === 'sphere') {{
+                styleSpec = {{ sphere: {{ scale: 0.3 }} }};
+            }} else if (currentStyle === 'line') {{
+                styleSpec = {{ line: {{}} }};
+            }}
+
+            if (currentColor === 'ss') {{
+                if (currentStyle === 'cartoon') {{
+                    styleSpec.cartoon.color = 'ss';
+                }} else {{
+                    styleSpec[currentStyle].colorscheme = 'ssJmol';
+                }}
+            }} else if (currentColor === 'bfactor') {{
+                // Color by B-factor (pLDDT) - blue high, red low
+                if (currentStyle === 'cartoon') {{
+                    styleSpec.cartoon.color = 'b';
+                    styleSpec.cartoon.colorscheme = {{ prop: 'b', gradient: 'roygb', min: 0, max: 100 }};
+                }} else {{
+                    styleSpec[currentStyle].colorscheme = {{ prop: 'b', gradient: 'roygb', min: 0, max: 100 }};
+                }}
+            }} else if (currentColor === 'chain') {{
+                if (currentStyle === 'cartoon') {{
+                    styleSpec.cartoon.color = 'chain';
+                }} else {{
+                    styleSpec[currentStyle].colorscheme = 'chain';
+                }}
+            }}
+
+            viewer.setStyle({{}}, styleSpec);
+            viewer.render();
+        }}
+    </script>
+</body>
+</html>
+'''
+
+    def _build_glossary_html(self) -> str:
+        """Build HTML for glossary section."""
+        items = []
+        for key in GLOSSARY:
+            entry = GLOSSARY[key]
+            items.append(
+                f'<div class="glossary-item">'
+                f'<div class="glossary-term">{entry["term"]}</div>'
+                f'<div class="glossary-def">{entry["definition"]}</div>'
+                f'</div>'
+            )
+        return "\n            ".join(items)
+
+    def _create_glossary_pages(self) -> list:
+        """Create glossary pages for PDF report."""
+        figures = []
+        entries = list(GLOSSARY.values())
+        entries_per_page = 8
+
+        for page_start in range(0, len(entries), entries_per_page):
+            page_entries = entries[page_start:page_start + entries_per_page]
+            fig, ax = plt.subplots(figsize=(8.5, 11))
+            ax.axis("off")
+
+            # Title
+            if page_start == 0:
+                ax.text(0.5, 0.96, "Glossary of Terms", fontsize=18, ha="center", fontweight="bold")
+                start_y = 0.90
+            else:
+                ax.text(0.5, 0.96, "Glossary of Terms (continued)", fontsize=18, ha="center", fontweight="bold")
+                start_y = 0.90
+
+            y = start_y
+            for entry in page_entries:
+                # Term in bold
+                ax.text(0.05, y, entry["term"], fontsize=11, fontweight="bold",
+                        transform=ax.transAxes, verticalalignment="top")
+                y -= 0.03
+
+                # Definition with word wrap
+                definition = entry["definition"]
+                # Simple word wrapping for PDF
+                words = definition.split()
+                lines = []
+                current_line = []
+                for word in words:
+                    current_line.append(word)
+                    if len(" ".join(current_line)) > 85:
+                        if len(current_line) > 1:
+                            current_line.pop()
+                            lines.append(" ".join(current_line))
+                            current_line = [word]
+                        else:
+                            lines.append(" ".join(current_line))
+                            current_line = []
+                if current_line:
+                    lines.append(" ".join(current_line))
+
+                for line in lines:
+                    ax.text(0.07, y, line, fontsize=9, color="#444",
+                            transform=ax.transAxes, verticalalignment="top")
+                    y -= 0.025
+
+                y -= 0.02  # Extra space between entries
+
+            figures.append(fig)
+
+        return figures

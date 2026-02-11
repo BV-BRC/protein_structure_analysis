@@ -119,12 +119,19 @@ def compare(structure1, structure2, output, pymol, plot, confidence_weighted, co
     # Generate PyMOL script
     if pymol and result.alignment:
         viz = AlignmentVisualizer()
+
+        # Generate aligned PDB path (same directory as output, with _aligned suffix)
+        pymol_path = Path(pymol)
+        aligned_pdb_path = pymol_path.parent / f"{struct2.name}_aligned.pdb"
+
         viz.generate_pymol_script(
             struct1, struct2, result.alignment,
             color_by="rmsd",
             output_path=pymol,
+            aligned_pdb_path=aligned_pdb_path,
         )
         click.echo(f"PyMOL script saved to: {pymol}")
+        click.echo(f"Aligned structure saved to: {aligned_pdb_path}")
 
     # Generate plot
     if plot and result.alignment:
@@ -274,12 +281,19 @@ def visualize(structure1, structure2, output, color_by, fmt):
 
     if fmt == "pymol":
         viz = AlignmentVisualizer()
+
+        # Generate aligned PDB path (same directory as output, with _aligned suffix)
+        output_path = Path(output)
+        aligned_pdb_path = output_path.parent / f"{struct2.name}_aligned.pdb"
+
         script = viz.generate_pymol_script(
             struct1, struct2, alignment,
             color_by=color_by,
             output_path=output,
+            aligned_pdb_path=aligned_pdb_path,
         )
         click.echo(f"PyMOL script saved to: {output}")
+        click.echo(f"Aligned structure saved to: {aligned_pdb_path}")
         click.echo("\nTo visualize, run:")
         click.echo(f"  pymol {output}")
 
@@ -346,25 +360,43 @@ def info(structure):
     loader = StructureLoader()
     struct = loader.load(structure)
 
+    # Detect structure type
+    structure_type = loader.detect_structure_type(struct)
+    is_predicted = structure_type == "predicted"
+
     click.echo(f"\nStructure: {struct.name}")
     click.echo(f"File: {structure}")
     click.echo(f"\nBasic Info:")
     click.echo(f"  Residues: {struct.n_residues}")
     click.echo(f"  Sequence: {struct.sequence[:50]}..." if len(struct.sequence) > 50 else f"  Sequence: {struct.sequence}")
 
-    click.echo(f"\nConfidence (pLDDT):")
-    click.echo(f"  Mean:   {struct.mean_plddt:.1f}")
-    click.echo(f"  Min:    {struct.plddt.min():.1f}")
-    click.echo(f"  Max:    {struct.plddt.max():.1f}")
+    if is_predicted:
+        click.echo(f"\nConfidence (pLDDT):")
+        click.echo(f"  Mean:   {struct.mean_plddt:.1f}")
+        click.echo(f"  Min:    {struct.plddt.min():.1f}")
+        click.echo(f"  Max:    {struct.plddt.max():.1f}")
 
-    n_high = sum(struct.high_confidence_mask)
-    n_low = sum(struct.low_confidence_mask)
-    click.echo(f"  High confidence (≥70): {n_high} ({100*n_high/struct.n_residues:.1f}%)")
-    click.echo(f"  Low confidence (<50):  {n_low} ({100*n_low/struct.n_residues:.1f}%)")
+        n_high = sum(struct.high_confidence_mask)
+        n_low = sum(struct.low_confidence_mask)
+        click.echo(f"  High confidence (≥70): {n_high} ({100*n_high/struct.n_residues:.1f}%)")
+        click.echo(f"  Low confidence (<50):  {n_low} ({100*n_low/struct.n_residues:.1f}%)")
 
-    # Detect source
-    source = loader.detect_prediction_source(struct)
-    click.echo(f"\nPredicted source: {source}")
+        # Detect source
+        source = loader.detect_prediction_source(struct)
+        click.echo(f"\nPredicted source: {source}")
+    else:
+        click.echo(f"\nB-factors (Å²):")
+        click.echo(f"  Mean:   {struct.mean_plddt:.1f}")
+        click.echo(f"  Min:    {struct.plddt.min():.1f}")
+        click.echo(f"  Max:    {struct.plddt.max():.1f}")
+
+        # B-factor interpretation
+        n_rigid = sum(struct.plddt < 20)
+        n_flexible = sum(struct.plddt > 40)
+        click.echo(f"  Rigid regions (B<20):    {n_rigid} ({100*n_rigid/struct.n_residues:.1f}%)")
+        click.echo(f"  Flexible regions (B>40): {n_flexible} ({100*n_flexible/struct.n_residues:.1f}%)")
+
+        click.echo(f"\nStructure type: Experimental")
 
 
 @cli.command()
@@ -420,11 +452,18 @@ def report(results_csv, output, fmt, min_tm, max_rmsd):
               help="Output format: html, pdf, or both")
 @click.option("--contact-cutoff", default=8.0, help="Contact map distance cutoff (Å)")
 @click.option("--dpi", default=150, help="Image resolution for plots")
-def characterize(structure, output, fmt, contact_cutoff, dpi):
+@click.option("--experimental", "is_experimental", is_flag=True, default=False,
+              help="Treat as experimental structure (B-factors instead of pLDDT)")
+@click.option("--predicted", "is_predicted", is_flag=True, default=False,
+              help="Treat as predicted structure (pLDDT confidence scores)")
+def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, is_predicted):
     """Generate comprehensive characterization report for a structure.
 
     Analyzes confidence scores, contacts, secondary structure, and
     sequence composition. Outputs HTML and/or PDF with embedded figures.
+
+    By default, auto-detects whether the structure is predicted (pLDDT)
+    or experimental (B-factors). Use --experimental or --predicted to override.
 
     Examples:
 
@@ -432,7 +471,9 @@ def characterize(structure, output, fmt, contact_cutoff, dpi):
 
         protein_compare characterize structure.pdb -o report.html --format html
 
-        protein_compare characterize structure.pdb --format pdf --dpi 300
+        protein_compare characterize experimental.pdb --experimental
+
+        protein_compare characterize alphafold.pdb --predicted --dpi 300
     """
     click.echo("Loading structure...")
 
@@ -443,14 +484,34 @@ def characterize(structure, output, fmt, contact_cutoff, dpi):
         click.echo(f"Error loading structure: {e}", err=True)
         sys.exit(1)
 
-    click.echo(f"  {struct.name}: {struct.n_residues} residues, mean pLDDT: {struct.mean_plddt:.1f}")
-    click.echo("\nGenerating characterization report...")
+    # Determine structure type
+    if is_experimental and is_predicted:
+        click.echo("Error: Cannot specify both --experimental and --predicted", err=True)
+        sys.exit(1)
+    elif is_experimental:
+        structure_type = "experimental"
+    elif is_predicted:
+        structure_type = "predicted"
+    else:
+        structure_type = None  # Auto-detect
 
+    # Create characterizer (will auto-detect if structure_type is None)
     characterizer = StructureCharacterizer(
         structure=struct,
         contact_cutoff=contact_cutoff,
         dpi=dpi,
+        structure_type=structure_type,
     )
+
+    # Show structure info with appropriate terminology
+    if characterizer.is_predicted:
+        click.echo(f"  {struct.name}: {struct.n_residues} residues, mean pLDDT: {struct.mean_plddt:.1f}")
+        click.echo(f"  Structure type: Predicted (pLDDT confidence scores)")
+    else:
+        click.echo(f"  {struct.name}: {struct.n_residues} residues, mean B-factor: {struct.mean_plddt:.1f} Ų")
+        click.echo(f"  Structure type: Experimental (B-factor flexibility)")
+
+    click.echo("\nGenerating characterization report...")
 
     # Determine output paths
     if output is None:
