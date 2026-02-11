@@ -128,7 +128,14 @@ class SecondaryStructureAnalyzer:
         # Run DSSP
         try:
             model = structure.biopython_structure[0]
-            dssp = DSSP(model, structure.biopython_structure, dssp=self.dssp_path)
+            # DSSP requires a file path, not a Structure object
+            if structure.source_path is not None:
+                dssp = DSSP(model, str(structure.source_path), dssp=self.dssp_path, file_type="PDB")
+            else:
+                raise ValueError("Structure must have source_path for DSSP")
+        except FileNotFoundError:
+            warnings.warn(f"DSSP binary not found ({self.dssp_path}). Using fallback assignment.")
+            return self._fallback_ss_assignment(structure, simplify)
         except Exception as e:
             warnings.warn(f"DSSP failed: {e}. Using fallback assignment.")
             return self._fallback_ss_assignment(structure, simplify)

@@ -24,6 +24,7 @@ class ProteinStructure:
     plddt: np.ndarray  # pLDDT scores per residue, shape (n_residues,)
     residue_ids: list[tuple[str, int]]  # (chain_id, residue_number)
     sequence: str  # One-letter amino acid sequence
+    source_path: Optional[Path] = None  # Original PDB file path
     biopython_structure: Optional[Structure] = field(default=None, repr=False)
 
     @property
@@ -139,6 +140,7 @@ class StructureLoader:
             plddt=np.array(plddt_scores),
             residue_ids=residue_ids,
             sequence="".join(sequence),
+            source_path=path,
             biopython_structure=structure,
         )
 

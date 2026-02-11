@@ -100,7 +100,8 @@ class StructuralAligner:
         result = tmtools.tm_align(coords1, coords2, seq1, seq2)
 
         # Extract aligned residue pairs from the alignment
-        residue_mapping = self._parse_alignment(result.alignment)
+        # tmtools returns seqxA, seqyA (aligned sequences with gaps)
+        residue_mapping = self._parse_alignment((result.seqxA, result.seqyA, result.seqM))
 
         # Get aligned coordinates
         aligned_idx1 = [m[0] for m in residue_mapping]
@@ -109,10 +110,10 @@ class StructuralAligner:
         aligned_coords_1 = coords1[aligned_idx1]
         aligned_coords_2 = coords2[aligned_idx2]
 
-        # Apply transformation to structure 2
-        transformed_coords_2 = self.apply_transform(
-            aligned_coords_2, result.u, result.t
-        )
+        # Apply transformation to structure 2 to align with structure 1
+        # tmtools returns u, t such that: coords1_aligned = coords1 @ u.T + t
+        # To get coords2 aligned to coords1: (coords2 - t) @ u
+        transformed_coords_2 = (aligned_coords_2 - result.t) @ result.u
 
         # Calculate per-residue distances
         per_residue_dist = np.linalg.norm(

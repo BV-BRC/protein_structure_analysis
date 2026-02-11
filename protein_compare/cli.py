@@ -19,6 +19,7 @@ from protein_compare.core.secondary import SecondaryStructureAnalyzer
 from protein_compare.visualization.alignment_viz import AlignmentVisualizer
 from protein_compare.visualization.contact_maps import ContactMapVisualizer
 from protein_compare.visualization.divergence import DivergenceAnalyzer, DivergenceVisualizer
+from protein_compare.visualization.structure_report import StructureCharacterizer
 
 
 @click.group()
@@ -410,6 +411,74 @@ def report(results_csv, output, fmt, min_tm, max_rmsd):
         out_path = output or "report.json"
         reporter.to_json(out_path)
         click.echo(f"JSON saved to: {out_path}")
+
+
+@cli.command()
+@click.argument("structure", type=click.Path(exists=True))
+@click.option("--output", "-o", type=click.Path(), help="Output file path (without extension for 'both' format)")
+@click.option("--format", "fmt", type=click.Choice(["html", "pdf", "both"]), default="both",
+              help="Output format: html, pdf, or both")
+@click.option("--contact-cutoff", default=8.0, help="Contact map distance cutoff (Å)")
+@click.option("--dpi", default=150, help="Image resolution for plots")
+def characterize(structure, output, fmt, contact_cutoff, dpi):
+    """Generate comprehensive characterization report for a structure.
+
+    Analyzes confidence scores, contacts, secondary structure, and
+    sequence composition. Outputs HTML and/or PDF with embedded figures.
+
+    Examples:
+
+        protein_compare characterize structure.pdb -o report
+
+        protein_compare characterize structure.pdb -o report.html --format html
+
+        protein_compare characterize structure.pdb --format pdf --dpi 300
+    """
+    click.echo("Loading structure...")
+
+    loader = StructureLoader()
+    try:
+        struct = loader.load(structure)
+    except Exception as e:
+        click.echo(f"Error loading structure: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"  {struct.name}: {struct.n_residues} residues, mean pLDDT: {struct.mean_plddt:.1f}")
+    click.echo("\nGenerating characterization report...")
+
+    characterizer = StructureCharacterizer(
+        structure=struct,
+        contact_cutoff=contact_cutoff,
+        dpi=dpi,
+    )
+
+    # Determine output paths
+    if output is None:
+        output = struct.name
+
+    # Remove extension if provided for "both" format
+    output_base = output
+    if output.endswith(".html") or output.endswith(".pdf"):
+        output_base = output.rsplit(".", 1)[0]
+
+    try:
+        if fmt in ("html", "both"):
+            html_path = f"{output_base}.html" if not output.endswith(".html") else output
+            click.echo("  Generating HTML report...")
+            characterizer.generate_html_report(html_path)
+            click.echo(f"  HTML report saved to: {html_path}")
+
+        if fmt in ("pdf", "both"):
+            pdf_path = f"{output_base}.pdf" if not output.endswith(".pdf") else output
+            click.echo("  Generating PDF report...")
+            characterizer.generate_pdf_report(pdf_path)
+            click.echo(f"  PDF report saved to: {pdf_path}")
+
+    except Exception as e:
+        click.echo(f"Error generating report: {e}", err=True)
+        sys.exit(1)
+
+    click.echo("\nCharacterization complete!")
 
 
 def main():
