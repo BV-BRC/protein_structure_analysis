@@ -19,7 +19,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 import matplotlib.patches as mpatches
 
-from protein_compare.io.parser import ProteinStructure
+from protein_compare.io.parser import ProteinStructure, PAEData, PAELoader
 from protein_compare.core.confidence import ConfidenceAnalyzer, ConfidenceStats
 from protein_compare.core.contacts import ContactMapAnalyzer
 from protein_compare.core.secondary import SecondaryStructureAnalyzer
@@ -153,6 +153,22 @@ GLOSSARY = {
         "term": "RMSD (Root Mean Square Deviation)",
         "definition": "A measure of average distance between aligned atoms (usually Cα) in Ångströms. Lower RMSD means more similar structures. Depends on alignment length.",
     },
+    "PAE": {
+        "term": "PAE (Predicted Aligned Error)",
+        "definition": "AlphaFold's estimate of position error (in Å) between residue pairs. Low PAE (<5Å) indicates high confidence in relative positions. High inter-domain PAE suggests flexible linkers or uncertain domain orientation.",
+    },
+    "pTM": {
+        "term": "pTM (Predicted TM-score)",
+        "definition": "AlphaFold's predicted TM-score (0-1) for the model. Values >0.5 indicate confident fold prediction. Higher is better.",
+    },
+    "ipTM": {
+        "term": "ipTM (Interface pTM)",
+        "definition": "For multimer predictions, measures confidence in protein-protein interfaces. Values >0.8 suggest reliable interface prediction.",
+    },
+    "Domain": {
+        "term": "Structural Domain",
+        "definition": "A compact, semi-independent folding unit within a protein. Domains often have low internal PAE but high PAE to other domains, indicating confident internal structure but uncertain relative orientation.",
+    },
     "Ångström": {
         "term": "Ångström (Å)",
         "definition": "Unit of length equal to 10⁻¹⁰ meters (0.1 nanometers). Standard unit for atomic distances. A typical C-C bond is ~1.5Å; contact distance cutoff is typically 8Å.",
@@ -197,6 +213,18 @@ class SSAnalysis:
     coil_count: int
 
 
+@dataclass
+class PAEAnalysis:
+    """PAE analysis results."""
+    pae_data: PAEData
+    mean_pae: float
+    median_pae: float
+    domains: list[list[int]]
+    n_domains: int
+    inter_domain_pae: Optional[float]  # Mean PAE between domains
+    intra_domain_pae: float  # Mean PAE within domains
+
+
 class StructureCharacterizer:
     """Generate comprehensive characterization of a single protein structure."""
 
@@ -206,6 +234,8 @@ class StructureCharacterizer:
         contact_cutoff: float = 8.0,
         dpi: int = 150,
         structure_type: Optional[str] = None,
+        pae_data: Optional[PAEData] = None,
+        pae_path: Optional[str] = None,
     ):
         """Initialize the characterizer.
 
@@ -214,6 +244,8 @@ class StructureCharacterizer:
             contact_cutoff: Distance cutoff for contacts in Ångströms.
             dpi: Resolution for generated figures.
             structure_type: "predicted" or "experimental". If None, auto-detects.
+            pae_data: Optional PAEData object for AlphaFold PAE visualization.
+            pae_path: Optional path to PAE JSON file. If provided, will load PAE data.
         """
         self.structure = structure
         self.contact_cutoff = contact_cutoff
@@ -228,6 +260,21 @@ class StructureCharacterizer:
 
         self.is_predicted = self.structure_type == "predicted"
 
+        # Handle PAE data
+        if pae_data is not None:
+            self.pae_data = pae_data
+        elif pae_path is not None:
+            self.pae_data = PAELoader.load(pae_path)
+        elif self.is_predicted and structure.source_path:
+            # Try to auto-find PAE file
+            pae_file = PAELoader.find_pae_file(structure.source_path)
+            if pae_file:
+                self.pae_data = PAELoader.load(pae_file)
+            else:
+                self.pae_data = None
+        else:
+            self.pae_data = None
+
         self.confidence_analyzer = ConfidenceAnalyzer()
         self.contact_analyzer = ContactMapAnalyzer(cutoff=contact_cutoff)
         self.ss_analyzer = SecondaryStructureAnalyzer()
@@ -235,6 +282,7 @@ class StructureCharacterizer:
         self._conf_stats: Optional[ConfidenceStats] = None
         self._contact_analysis: Optional[ContactAnalysis] = None
         self._ss_analysis: Optional[SSAnalysis] = None
+        self._pae_analysis: Optional[PAEAnalysis] = None
 
     def analyze_sequence_composition(self) -> SequenceComposition:
         """Analyze amino acid composition."""
@@ -295,6 +343,54 @@ class StructureCharacterizer:
         h, e, c = ss_seq.count("H"), ss_seq.count("E"), ss_seq.count("C")
         self._ss_analysis = SSAnalysis(ss_seq, h/n if n else 0, e/n if n else 0, c/n if n else 0, h, e, c)
         return self._ss_analysis
+
+    def analyze_pae(self) -> Optional[PAEAnalysis]:
+        """Analyze PAE data if available.
+
+        Returns:
+            PAEAnalysis object or None if no PAE data.
+        """
+        if self._pae_analysis is not None:
+            return self._pae_analysis
+        if self.pae_data is None:
+            return None
+
+        pae = self.pae_data
+        domains = pae.identify_domains(pae_cutoff=5.0, min_domain_size=15)
+
+        # Calculate intra-domain PAE (mean PAE within domains)
+        intra_pae_values = []
+        for domain in domains:
+            if len(domain) > 1:
+                for i, idx1 in enumerate(domain):
+                    for idx2 in domain[i+1:]:
+                        intra_pae_values.append(pae.pae_matrix[idx1, idx2])
+        intra_domain_pae = np.mean(intra_pae_values) if intra_pae_values else 0.0
+
+        # Calculate inter-domain PAE (mean PAE between domains)
+        inter_domain_pae = None
+        if len(domains) > 1:
+            inter_pae_values = []
+            for i, dom1 in enumerate(domains):
+                for dom2 in domains[i+1:]:
+                    inter_pae_values.append(pae.get_domain_pae(dom1, dom2))
+            inter_domain_pae = np.mean(inter_pae_values) if inter_pae_values else None
+
+        self._pae_analysis = PAEAnalysis(
+            pae_data=pae,
+            mean_pae=pae.mean_pae,
+            median_pae=pae.median_pae,
+            domains=domains,
+            n_domains=len(domains),
+            inter_domain_pae=inter_domain_pae,
+            intra_domain_pae=intra_domain_pae,
+        )
+        return self._pae_analysis
+
+    @property
+    def has_pae(self) -> bool:
+        """Check if PAE data is available."""
+        return self.pae_data is not None
 
     def _get_bfactor_color(self, val: float) -> str:
         """Get color for B-factor value (experimental structures)."""
@@ -511,6 +607,190 @@ class StructureCharacterizer:
         fig.tight_layout()
         return fig
 
+    def plot_pae_heatmap(self) -> Optional[Figure]:
+        """Plot PAE heatmap.
+
+        Returns:
+            Figure or None if no PAE data available.
+        """
+        if not self.has_pae:
+            return None
+
+        pae_analysis = self.analyze_pae()
+        pae = pae_analysis.pae_data
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+        # Use green-white color scheme (low PAE = green, high PAE = white)
+        # This matches AlphaFold's standard visualization
+        cmap = plt.cm.Greens_r
+
+        im = ax.imshow(pae.pae_matrix, cmap=cmap, origin="lower", aspect="equal",
+                       vmin=0, vmax=pae.max_pae)
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8, label="Expected Position Error (Å)")
+
+        # Add domain boundaries if multiple domains detected
+        if pae_analysis.n_domains > 1:
+            for domain in pae_analysis.domains:
+                if len(domain) > 0:
+                    start, end = min(domain), max(domain)
+                    rect = plt.Rectangle((start - 0.5, start - 0.5), end - start + 1, end - start + 1,
+                                          fill=False, edgecolor="red", linewidth=2, linestyle="--")
+                    ax.add_patch(rect)
+
+        # Add diagonal line
+        n = len(pae.pae_matrix)
+        ax.plot([0, n-1], [0, n-1], "k--", linewidth=0.5, alpha=0.3)
+
+        # Stats text
+        txt_lines = [f"Mean PAE: {pae_analysis.mean_pae:.1f} Å"]
+        if pae.ptm is not None:
+            txt_lines.append(f"pTM: {pae.ptm:.3f}")
+        if pae.iptm is not None:
+            txt_lines.append(f"ipTM: {pae.iptm:.3f}")
+        if pae_analysis.n_domains > 1:
+            txt_lines.append(f"Domains: {pae_analysis.n_domains}")
+        ax.text(0.02, 0.98, "\n".join(txt_lines), transform=ax.transAxes, fontsize=10, va="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+        ax.set_xlabel("Residue Number")
+        ax.set_ylabel("Residue Number")
+        ax.set_title("Predicted Aligned Error (PAE)")
+        fig.tight_layout()
+        return fig
+
+    def plot_pae_domains(self) -> Optional[Figure]:
+        """Plot PAE with domain analysis.
+
+        Shows both the PAE heatmap and a domain segmentation bar.
+
+        Returns:
+            Figure or None if no PAE data available.
+        """
+        if not self.has_pae:
+            return None
+
+        pae_analysis = self.analyze_pae()
+        pae = pae_analysis.pae_data
+        n = pae.n_residues
+
+        fig = plt.figure(figsize=(10, 10))
+        gs = fig.add_gridspec(2, 2, height_ratios=[1, 15], width_ratios=[15, 1],
+                              hspace=0.02, wspace=0.02)
+
+        ax_main = fig.add_subplot(gs[1, 0])
+        ax_top = fig.add_subplot(gs[0, 0], sharex=ax_main)
+        ax_right = fig.add_subplot(gs[1, 1], sharey=ax_main)
+
+        # Main PAE heatmap
+        cmap = plt.cm.Greens_r
+        im = ax_main.imshow(pae.pae_matrix, cmap=cmap, origin="lower", aspect="equal",
+                            vmin=0, vmax=pae.max_pae)
+
+        # Domain coloring
+        domain_colors = plt.cm.tab10.colors
+        domain_assignment = np.zeros(n)
+        for i, domain in enumerate(pae_analysis.domains):
+            for idx in domain:
+                domain_assignment[idx] = i + 1
+
+        # Top bar showing domain assignment
+        for i in range(n):
+            color = domain_colors[int(domain_assignment[i]) % len(domain_colors)] if domain_assignment[i] > 0 else "#CCCCCC"
+            ax_top.bar(i, 1, color=color, width=1.0, edgecolor="none")
+        ax_top.set_xlim(-0.5, n - 0.5)
+        ax_top.set_ylim(0, 1)
+        ax_top.axis("off")
+        ax_top.set_title(f"Predicted Aligned Error (PAE) - {pae_analysis.n_domains} Domain(s) Detected")
+
+        # Right bar showing pLDDT if available
+        if self.is_predicted:
+            plddt = self.structure.plddt
+            for i in range(len(plddt)):
+                color = self._get_plddt_color(plddt[i])
+                ax_right.barh(i, 1, color=color, height=1.0, edgecolor="none")
+            ax_right.set_ylim(-0.5, len(plddt) - 0.5)
+            ax_right.set_xlim(0, 1)
+        ax_right.axis("off")
+
+        # Add domain boundaries to main plot
+        for domain in pae_analysis.domains:
+            if len(domain) > 0:
+                start, end = min(domain), max(domain)
+                rect = plt.Rectangle((start - 0.5, start - 0.5), end - start + 1, end - start + 1,
+                                      fill=False, edgecolor="red", linewidth=2, linestyle="--")
+                ax_main.add_patch(rect)
+
+        ax_main.set_xlabel("Residue Number")
+        ax_main.set_ylabel("Residue Number")
+
+        # Colorbar
+        cbar = fig.colorbar(im, ax=ax_right, shrink=0.8, label="Expected Position Error (Å)",
+                            location="right", pad=0.3)
+
+        # Stats
+        txt_lines = [f"Mean PAE: {pae_analysis.mean_pae:.1f} Å",
+                     f"Intra-domain: {pae_analysis.intra_domain_pae:.1f} Å"]
+        if pae_analysis.inter_domain_pae is not None:
+            txt_lines.append(f"Inter-domain: {pae_analysis.inter_domain_pae:.1f} Å")
+        if pae.ptm is not None:
+            txt_lines.append(f"pTM: {pae.ptm:.3f}")
+        if pae.iptm is not None:
+            txt_lines.append(f"ipTM: {pae.iptm:.3f}")
+        ax_main.text(0.02, 0.98, "\n".join(txt_lines), transform=ax_main.transAxes, fontsize=10, va="top",
+                     bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+        plt.tight_layout()
+        return fig
+
+    def plot_pae_per_residue(self) -> Optional[Figure]:
+        """Plot per-residue mean PAE.
+
+        Shows the average PAE for each residue (how confident we are about its
+        position relative to all other residues).
+
+        Returns:
+            Figure or None if no PAE data available.
+        """
+        if not self.has_pae:
+            return None
+
+        pae = self.pae_data
+        pae_analysis = self.analyze_pae()
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+
+        # Mean PAE per residue (average of row and column to get symmetric measure)
+        mean_pae_per_res = (np.mean(pae.pae_matrix, axis=0) + np.mean(pae.pae_matrix, axis=1)) / 2
+        residues = np.arange(1, len(mean_pae_per_res) + 1)
+
+        # Color by domain if multiple domains
+        if pae_analysis.n_domains > 1:
+            domain_colors = plt.cm.tab10.colors
+            domain_assignment = np.zeros(len(mean_pae_per_res), dtype=int)
+            for i, domain in enumerate(pae_analysis.domains):
+                for idx in domain:
+                    domain_assignment[idx] = i
+            colors = [domain_colors[d % len(domain_colors)] for d in domain_assignment]
+            ax.bar(residues, mean_pae_per_res, color=colors, width=1.0)
+        else:
+            # Color by PAE value
+            colors = ['#2ca02c' if v < 5 else '#ff7f0e' if v < 10 else '#d62728' for v in mean_pae_per_res]
+            ax.bar(residues, mean_pae_per_res, color=colors, width=1.0)
+
+        # Threshold lines
+        ax.axhline(y=5, color="green", linestyle="--", alpha=0.7, label="5Å (high confidence)")
+        ax.axhline(y=10, color="orange", linestyle="--", alpha=0.7, label="10Å (medium confidence)")
+
+        ax.set_xlabel("Residue Number")
+        ax.set_ylabel("Mean PAE (Å)")
+        ax.set_title("Per-Residue Predicted Aligned Error")
+        ax.set_xlim(1, len(mean_pae_per_res))
+        ax.set_ylim(0, min(pae.max_pae, np.max(mean_pae_per_res) * 1.1))
+        ax.legend(loc="upper right")
+        fig.tight_layout()
+        return fig
+
     def _fig_to_base64(self, fig: Figure) -> str:
         """Convert figure to base64 PNG string."""
         buf = BytesIO()
@@ -520,7 +800,7 @@ class StructureCharacterizer:
 
     def generate_all_figures(self) -> dict:
         """Generate all characterization figures."""
-        return {
+        figures = {
             "plddt_distribution": self.plot_plddt_distribution(),
             "plddt_profile": self.plot_plddt_profile(),
             "contact_map": self.plot_contact_map(),
@@ -531,12 +811,27 @@ class StructureCharacterizer:
             "ss_profile": self.plot_ss_profile(),
         }
 
+        # Add PAE figures if available
+        if self.has_pae:
+            pae_heatmap = self.plot_pae_heatmap()
+            if pae_heatmap:
+                figures["pae_heatmap"] = pae_heatmap
+            pae_domains = self.plot_pae_domains()
+            if pae_domains:
+                figures["pae_domains"] = pae_domains
+            pae_per_residue = self.plot_pae_per_residue()
+            if pae_per_residue:
+                figures["pae_per_residue"] = pae_per_residue
+
+        return figures
+
     def generate_html_report(self, output_path: str) -> None:
         """Generate self-contained HTML report with embedded images."""
         seq_comp = self.analyze_sequence_composition()
         conf_stats = self.analyze_confidence()
         contact_analysis = self.analyze_contacts()
         ss_analysis = self.analyze_secondary_structure()
+        pae_analysis = self.analyze_pae()  # May be None
         figures = self.generate_all_figures()
         images_b64 = {name: self._fig_to_base64(fig) for name, fig in figures.items()}
         for fig in figures.values():
@@ -545,7 +840,7 @@ class StructureCharacterizer:
         pdb_content = ""
         if self.structure.source_path and self.structure.source_path.exists():
             pdb_content = self.structure.source_path.read_text()
-        html = self._build_html(seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, pdb_content)
+        html = self._build_html(seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, pdb_content, pae_analysis)
         Path(output_path).write_text(html)
 
     def generate_pdf_report(self, output_path: str) -> None:
@@ -554,20 +849,27 @@ class StructureCharacterizer:
         conf_stats = self.analyze_confidence()
         contact_analysis = self.analyze_contacts()
         ss_analysis = self.analyze_secondary_structure()
+        pae_analysis = self.analyze_pae()  # May be None
         with PdfPages(output_path) as pdf:
-            fig = self._create_summary_page(seq_comp, conf_stats, contact_analysis, ss_analysis)
+            fig = self._create_summary_page(seq_comp, conf_stats, contact_analysis, ss_analysis, pae_analysis)
             pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
             for plot_fn in [self.plot_aa_composition, self.plot_plddt_distribution, self.plot_plddt_profile,
                             self.plot_contact_map, self.plot_contact_order, self.plot_residue_contacts,
                             self.plot_ss_composition, self.plot_ss_profile]:
                 fig = plot_fn()
                 pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+            # Add PAE plots if available
+            if self.has_pae:
+                for plot_fn in [self.plot_pae_heatmap, self.plot_pae_domains, self.plot_pae_per_residue]:
+                    fig = plot_fn()
+                    if fig:
+                        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
             # Add glossary pages
             glossary_figs = self._create_glossary_pages()
             for fig in glossary_figs:
                 pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
-    def _create_summary_page(self, seq_comp, conf_stats, contact_analysis, ss_analysis) -> Figure:
+    def _create_summary_page(self, seq_comp, conf_stats, contact_analysis, ss_analysis, pae_analysis=None) -> Figure:
         """Create summary page for PDF."""
         fig, ax = plt.subplots(figsize=(8.5, 11))
         ax.axis("off")
@@ -603,6 +905,25 @@ class StructureCharacterizer:
             f"High Confidence:    {conf_stats.frac_confident:.1%}" if self.is_predicted else f"Ordered (<30):      {np.sum(self.structure.plddt < 30) / len(self.structure.plddt):.1%}",
             f"{high_label}:    {high_value} residues",
             f"{low_label}:     {low_value} residues",
+        ]
+
+        # Add PAE section if available
+        if pae_analysis is not None:
+            lines.extend([
+                "", "=" * 50, "PREDICTED ALIGNED ERROR (PAE)", "=" * 50,
+                f"Mean PAE:           {pae_analysis.mean_pae:.1f} Å",
+                f"Median PAE:         {pae_analysis.median_pae:.1f} Å",
+                f"Domains Detected:   {pae_analysis.n_domains}",
+                f"Intra-domain PAE:   {pae_analysis.intra_domain_pae:.1f} Å",
+            ])
+            if pae_analysis.inter_domain_pae is not None:
+                lines.append(f"Inter-domain PAE:   {pae_analysis.inter_domain_pae:.1f} Å")
+            if pae_analysis.pae_data.ptm is not None:
+                lines.append(f"pTM Score:          {pae_analysis.pae_data.ptm:.3f}")
+            if pae_analysis.pae_data.iptm is not None:
+                lines.append(f"ipTM Score:         {pae_analysis.pae_data.iptm:.3f}")
+
+        lines.extend([
             "", "=" * 50, "CONTACT ANALYSIS", "=" * 50,
             f"Total Contacts:     {contact_analysis.n_contacts}",
             f"Contact Density:    {contact_analysis.contact_density:.3f}",
@@ -616,11 +937,11 @@ class StructureCharacterizer:
             f"Polar:              {seq_comp.type_fractions.get('polar', 0):.1%}",
             f"Charged (+):        {seq_comp.type_fractions.get('positive', 0):.1%}",
             f"Charged (-):        {seq_comp.type_fractions.get('negative', 0):.1%}",
-        ]
+        ])
         ax.text(0.1, 0.85, "\n".join(lines), fontsize=10, ha="left", va="top", family="monospace", transform=ax.transAxes)
         return fig
 
-    def _build_html(self, seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, pdb_content="") -> str:
+    def _build_html(self, seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, pdb_content="", pae_analysis=None) -> str:
         """Build HTML report string."""
         # Escape PDB content for JavaScript
         pdb_escaped = pdb_content.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$") if pdb_content else ""
@@ -772,6 +1093,8 @@ class StructureCharacterizer:
         <div class="figure"><img src="data:image/png;base64,{images_b64["ss_profile"]}" alt="SS Profile"><div class="figure-caption">Secondary structure profile</div></div>
     </div>
 
+    {self._build_pae_html_section(pae_analysis, images_b64)}
+
     <div class="section" id="glossary">
         <h2>Glossary of Terms</h2>
         <div class="glossary-grid">
@@ -871,6 +1194,52 @@ class StructureCharacterizer:
                 f'</div>'
             )
         return "\n            ".join(items)
+
+    def _build_pae_html_section(self, pae_analysis: Optional[PAEAnalysis], images_b64: dict) -> str:
+        """Build HTML for PAE section if PAE data is available."""
+        if pae_analysis is None or "pae_heatmap" not in images_b64:
+            return ""  # No PAE section if no data
+
+        # Build metrics for PAE
+        ptm_html = ""
+        if pae_analysis.pae_data.ptm is not None:
+            ptm_html = f'''<div class="metric-box highlight"><div class="metric-value">{pae_analysis.pae_data.ptm:.3f}</div><div class="metric-label">pTM Score</div></div>'''
+
+        iptm_html = ""
+        if pae_analysis.pae_data.iptm is not None:
+            iptm_html = f'''<div class="metric-box"><div class="metric-value">{pae_analysis.pae_data.iptm:.3f}</div><div class="metric-label">ipTM Score</div></div>'''
+
+        inter_domain_html = ""
+        if pae_analysis.inter_domain_pae is not None:
+            inter_domain_html = f'''<div class="metric-box"><div class="metric-value">{pae_analysis.inter_domain_pae:.1f} Å</div><div class="metric-label">Inter-domain PAE</div></div>'''
+
+        # PAE domains figure (if available)
+        pae_domains_html = ""
+        if "pae_domains" in images_b64:
+            pae_domains_html = f'''<div class="figure"><img src="data:image/png;base64,{images_b64["pae_domains"]}" alt="PAE Domains"><div class="figure-caption">PAE heatmap with domain segmentation</div></div>'''
+
+        # Per-residue PAE figure (if available)
+        pae_per_residue_html = ""
+        if "pae_per_residue" in images_b64:
+            pae_per_residue_html = f'''<div class="figure"><img src="data:image/png;base64,{images_b64["pae_per_residue"]}" alt="PAE Per Residue"><div class="figure-caption">Per-residue mean PAE</div></div>'''
+
+        return f'''
+    <div class="section" id="pae"><h2>Predicted Aligned Error (PAE)</h2>
+        <p style="color: #666; margin-bottom: 15px;">PAE measures the expected position error (in Ångströms) between residue pairs. Low PAE indicates high confidence in relative positioning. Off-diagonal blocks with high PAE may indicate domain boundaries or flexible regions.</p>
+        <div class="metrics-grid">
+            <div class="metric-box"><div class="metric-value">{pae_analysis.mean_pae:.1f} Å</div><div class="metric-label">Mean PAE</div></div>
+            <div class="metric-box"><div class="metric-value">{pae_analysis.median_pae:.1f} Å</div><div class="metric-label">Median PAE</div></div>
+            <div class="metric-box"><div class="metric-value">{pae_analysis.n_domains}</div><div class="metric-label">Domains Detected</div></div>
+            <div class="metric-box"><div class="metric-value">{pae_analysis.intra_domain_pae:.1f} Å</div><div class="metric-label">Intra-domain PAE</div></div>
+            {inter_domain_html}
+            {ptm_html}
+            {iptm_html}
+        </div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["pae_heatmap"]}" alt="PAE Heatmap"><div class="figure-caption">Predicted Aligned Error matrix (green = low error, white = high error)</div></div>
+        {pae_domains_html}
+        {pae_per_residue_html}
+    </div>
+'''
 
     def _create_glossary_pages(self) -> list:
         """Create glossary pages for PDF report."""

@@ -456,7 +456,9 @@ def report(results_csv, output, fmt, min_tm, max_rmsd):
               help="Treat as experimental structure (B-factors instead of pLDDT)")
 @click.option("--predicted", "is_predicted", is_flag=True, default=False,
               help="Treat as predicted structure (pLDDT confidence scores)")
-def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, is_predicted):
+@click.option("--pae", "pae_path", type=click.Path(exists=True), default=None,
+              help="Path to PAE JSON file (AlphaFold predicted aligned error)")
+def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, is_predicted, pae_path):
     """Generate comprehensive characterization report for a structure.
 
     Analyzes confidence scores, contacts, secondary structure, and
@@ -464,6 +466,9 @@ def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, i
 
     By default, auto-detects whether the structure is predicted (pLDDT)
     or experimental (B-factors). Use --experimental or --predicted to override.
+
+    For AlphaFold structures, use --pae to provide the PAE JSON file for
+    domain analysis and confidence visualization.
 
     Examples:
 
@@ -474,6 +479,8 @@ def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, i
         protein_compare characterize experimental.pdb --experimental
 
         protein_compare characterize alphafold.pdb --predicted --dpi 300
+
+        protein_compare characterize alphafold.pdb --pae alphafold_scores.json
     """
     click.echo("Loading structure...")
 
@@ -501,12 +508,18 @@ def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, i
         contact_cutoff=contact_cutoff,
         dpi=dpi,
         structure_type=structure_type,
+        pae_path=pae_path,
     )
 
     # Show structure info with appropriate terminology
     if characterizer.is_predicted:
         click.echo(f"  {struct.name}: {struct.n_residues} residues, mean pLDDT: {struct.mean_plddt:.1f}")
         click.echo(f"  Structure type: Predicted (pLDDT confidence scores)")
+        if characterizer.has_pae:
+            pae_analysis = characterizer.analyze_pae()
+            click.echo(f"  PAE loaded: mean {pae_analysis.mean_pae:.1f} Å, {pae_analysis.n_domains} domain(s) detected")
+            if pae_analysis.pae_data.ptm is not None:
+                click.echo(f"  pTM: {pae_analysis.pae_data.ptm:.3f}")
     else:
         click.echo(f"  {struct.name}: {struct.n_residues} residues, mean B-factor: {struct.mean_plddt:.1f} Ų")
         click.echo(f"  Structure type: Experimental (B-factor flexibility)")
