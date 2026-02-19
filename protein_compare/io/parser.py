@@ -197,6 +197,155 @@ class ChaiScoresLoader:
 
 
 @dataclass
+class MSADepth:
+    """Container for MSA (Multiple Sequence Alignment) depth data from Chai.
+
+    MSA depth indicates the number of homologous sequences aligned at each
+    position, which correlates with prediction confidence.
+    """
+
+    positions: np.ndarray  # Residue positions, shape (n_residues,)
+    depths: np.ndarray  # MSA depth per position, shape (n_residues,)
+    source_path: Optional[Path] = None
+
+    @property
+    def n_residues(self) -> int:
+        """Number of residues."""
+        return len(self.positions)
+
+    @property
+    def mean_depth(self) -> float:
+        """Mean MSA depth across all positions."""
+        return float(np.mean(self.depths))
+
+    @property
+    def median_depth(self) -> float:
+        """Median MSA depth."""
+        return float(np.median(self.depths))
+
+    @property
+    def max_depth(self) -> int:
+        """Maximum MSA depth."""
+        return int(np.max(self.depths))
+
+    @property
+    def min_depth(self) -> int:
+        """Minimum MSA depth."""
+        return int(np.min(self.depths))
+
+
+class MSADepthLoader:
+    """Load MSA depth data from Chai parquet files.
+
+    Requires pyarrow or fastparquet to be installed.
+    """
+
+    @staticmethod
+    def is_available() -> bool:
+        """Check if parquet reading is available (pyarrow installed)."""
+        try:
+            import pandas as pd
+            # Try to import a parquet engine
+            pd.read_parquet  # Just check the method exists
+            # Actually test if an engine is available
+            try:
+                import pyarrow
+                return True
+            except ImportError:
+                pass
+            try:
+                import fastparquet
+                return True
+            except ImportError:
+                pass
+            return False
+        except ImportError:
+            return False
+
+    def load(self, path: str | Path) -> MSADepth:
+        """Load MSA depth from parquet file.
+
+        Args:
+            path: Path to .aligned.pqt file from Chai MSA output.
+
+        Returns:
+            MSADepth object with per-position depth data.
+
+        Raises:
+            ImportError: If pyarrow/fastparquet is not installed.
+            FileNotFoundError: If parquet file doesn't exist.
+            ValueError: If file format is invalid.
+        """
+        if not self.is_available():
+            raise ImportError(
+                "MSA depth loading requires pyarrow or fastparquet. "
+                "Install with: pip install pyarrow"
+            )
+
+        import pandas as pd
+
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"MSA parquet file not found: {path}")
+
+        try:
+            df = pd.read_parquet(path)
+        except Exception as e:
+            raise ValueError(f"Failed to load parquet file {path}: {e}")
+
+        # Extract MSA depth per position
+        # The parquet contains aligned sequences; depth = number of non-gap chars per column
+        if "sequence" in df.columns:
+            # Each row is a sequence in the alignment
+            sequences = df["sequence"].values
+            if len(sequences) > 0:
+                # Use maximum sequence length to handle variable-length sequences
+                seq_len = max(len(s) for s in sequences)
+                depths = np.zeros(seq_len, dtype=int)
+                for seq in sequences:
+                    for i, char in enumerate(seq):
+                        if char != "-" and char != ".":
+                            depths[i] += 1
+                positions = np.arange(seq_len)
+            else:
+                positions = np.array([])
+                depths = np.array([])
+        else:
+            # Fallback: assume columns represent positions
+            # This handles different parquet formats
+            positions = np.arange(len(df))
+            depths = np.ones(len(df), dtype=int) * len(df.columns)
+
+        return MSADepth(
+            positions=positions,
+            depths=depths,
+            source_path=path,
+        )
+
+    def find_msa_file(self, structure_path: Path) -> Optional[Path]:
+        """Try to find MSA parquet file in Chai output directory.
+
+        Args:
+            structure_path: Path to structure file (e.g., pred.model_idx_0.cif).
+
+        Returns:
+            Path to MSA parquet file if found, None otherwise.
+        """
+        parent = structure_path.parent
+        msas_dir = parent / "msas"
+
+        if msas_dir.exists():
+            pqt_files = list(msas_dir.glob("*.aligned.pqt"))
+            if len(pqt_files) == 1:
+                return pqt_files[0]
+            elif len(pqt_files) > 1:
+                # Return the first one (could improve matching logic)
+                return pqt_files[0]
+
+        return None
+
+
+@dataclass
 class ProteinStructure:
     """Container for protein structure data with confidence scores."""
 

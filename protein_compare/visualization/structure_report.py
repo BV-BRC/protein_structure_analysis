@@ -19,7 +19,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 import matplotlib.patches as mpatches
 
-from protein_compare.io.parser import ProteinStructure, PAEData, PAELoader
+from protein_compare.io.parser import ProteinStructure, PAEData, PAELoader, ChaiScores, ChaiScoresLoader, MSADepth, MSADepthLoader
 from protein_compare.core.confidence import ConfidenceAnalyzer, ConfidenceStats
 from protein_compare.core.contacts import ContactMapAnalyzer
 from protein_compare.core.secondary import SecondaryStructureAnalyzer
@@ -236,6 +236,10 @@ class StructureCharacterizer:
         structure_type: Optional[str] = None,
         pae_data: Optional[PAEData] = None,
         pae_path: Optional[str] = None,
+        chai_scores: Optional[ChaiScores] = None,
+        chai_scores_path: Optional[str] = None,
+        msa_depth: Optional[MSADepth] = None,
+        msa_path: Optional[str] = None,
     ):
         """Initialize the characterizer.
 
@@ -246,6 +250,10 @@ class StructureCharacterizer:
             structure_type: "predicted" or "experimental". If None, auto-detects.
             pae_data: Optional PAEData object for AlphaFold PAE visualization.
             pae_path: Optional path to PAE JSON file. If provided, will load PAE data.
+            chai_scores: Optional ChaiScores object for Chai confidence metrics.
+            chai_scores_path: Optional path to Chai scores NPZ file.
+            msa_depth: Optional MSADepth object for MSA depth visualization.
+            msa_path: Optional path to MSA parquet file.
         """
         self.structure = structure
         self.contact_cutoff = contact_cutoff
@@ -274,6 +282,42 @@ class StructureCharacterizer:
                 self.pae_data = None
         else:
             self.pae_data = None
+
+        # Handle Chai scores
+        if chai_scores is not None:
+            self.chai_scores = chai_scores
+        elif chai_scores_path is not None:
+            self.chai_scores = ChaiScoresLoader().load(chai_scores_path)
+        elif self.is_predicted and structure.source_path:
+            # Try to auto-find Chai scores file
+            chai_scores_file = self._find_chai_scores_file(structure.source_path)
+            if chai_scores_file:
+                self.chai_scores = ChaiScoresLoader().load(chai_scores_file)
+            else:
+                self.chai_scores = None
+        else:
+            self.chai_scores = None
+
+        # Handle MSA depth data (optional, requires pyarrow)
+        if msa_depth is not None:
+            self.msa_depth = msa_depth
+        elif msa_path is not None and MSADepthLoader.is_available():
+            try:
+                self.msa_depth = MSADepthLoader().load(msa_path)
+            except Exception:
+                self.msa_depth = None
+        elif self.is_predicted and structure.source_path and MSADepthLoader.is_available():
+            # Try to auto-find MSA file
+            msa_file = MSADepthLoader().find_msa_file(structure.source_path)
+            if msa_file:
+                try:
+                    self.msa_depth = MSADepthLoader().load(msa_file)
+                except Exception:
+                    self.msa_depth = None
+            else:
+                self.msa_depth = None
+        else:
+            self.msa_depth = None
 
         self.confidence_analyzer = ConfidenceAnalyzer()
         self.contact_analyzer = ContactMapAnalyzer(cutoff=contact_cutoff)
@@ -391,6 +435,47 @@ class StructureCharacterizer:
     def has_pae(self) -> bool:
         """Check if PAE data is available."""
         return self.pae_data is not None
+
+    @property
+    def has_chai_scores(self) -> bool:
+        """Check if Chai scores are available."""
+        return self.chai_scores is not None
+
+    @property
+    def has_msa_depth(self) -> bool:
+        """Check if MSA depth data is available."""
+        return self.msa_depth is not None
+
+    def _find_chai_scores_file(self, structure_path: Path) -> Optional[Path]:
+        """Try to find Chai scores file in same directory as structure.
+
+        Looks for scores.model_idx_*.npz files matching the structure name.
+        """
+        parent = structure_path.parent
+        stem = structure_path.stem
+
+        # Extract model index from structure name (e.g., pred.model_idx_0)
+        if "model_idx_" in stem:
+            # Try exact match first
+            scores_file = parent / f"scores.{stem.split('pred.')[-1]}.npz"
+            if scores_file.exists():
+                return scores_file
+
+            # Try pattern match
+            import re
+            match = re.search(r'model_idx_(\d+)', stem)
+            if match:
+                idx = match.group(1)
+                scores_file = parent / f"scores.model_idx_{idx}.npz"
+                if scores_file.exists():
+                    return scores_file
+
+        # Look for any scores file in directory
+        scores_files = list(parent.glob("scores.model_idx_*.npz"))
+        if len(scores_files) == 1:
+            return scores_files[0]
+
+        return None
 
     def _get_bfactor_color(self, val: float) -> str:
         """Get color for B-factor value (experimental structures)."""
@@ -791,6 +876,53 @@ class StructureCharacterizer:
         fig.tight_layout()
         return fig
 
+    def plot_msa_depth(self) -> Optional[Figure]:
+        """Plot MSA depth profile.
+
+        Shows the number of homologous sequences aligned at each position,
+        which correlates with prediction confidence.
+
+        Returns:
+            Figure or None if no MSA depth data available.
+        """
+        if not self.has_msa_depth:
+            return None
+
+        msa = self.msa_depth
+        fig, ax = plt.subplots(figsize=(12, 4))
+
+        positions = np.arange(1, msa.n_residues + 1)
+        depths = msa.depths
+
+        # Color bars by depth (darker = deeper MSA)
+        max_depth = msa.max_depth
+        colors = plt.cm.Blues(depths / max_depth * 0.8 + 0.2)  # Scale to avoid too light
+        ax.bar(positions, depths, color=colors, width=1.0, edgecolor='none')
+
+        # Add mean line
+        ax.axhline(y=msa.mean_depth, color="red", linestyle="--", linewidth=1.5,
+                   label=f"Mean: {msa.mean_depth:.0f}")
+
+        # Add threshold lines for interpretation
+        if max_depth > 100:
+            ax.axhline(y=100, color="green", linestyle=":", alpha=0.7, label="100 (good coverage)")
+        if max_depth > 1000:
+            ax.axhline(y=1000, color="blue", linestyle=":", alpha=0.7, label="1000 (excellent coverage)")
+
+        # Stats text box
+        txt = f"Mean: {msa.mean_depth:.0f}\nMedian: {msa.median_depth:.0f}\nMax: {msa.max_depth}\nMin: {msa.min_depth}"
+        ax.text(0.02, 0.98, txt, transform=ax.transAxes, fontsize=10, va="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+        ax.set_xlabel("Residue Position")
+        ax.set_ylabel("MSA Depth")
+        ax.set_title("Multiple Sequence Alignment Depth")
+        ax.set_xlim(1, msa.n_residues)
+        ax.set_ylim(0, max_depth * 1.1)
+        ax.legend(loc="upper right")
+        fig.tight_layout()
+        return fig
+
     def _fig_to_base64(self, fig: Figure) -> str:
         """Convert figure to base64 PNG string."""
         buf = BytesIO()
@@ -822,6 +954,12 @@ class StructureCharacterizer:
             pae_per_residue = self.plot_pae_per_residue()
             if pae_per_residue:
                 figures["pae_per_residue"] = pae_per_residue
+
+        # Add MSA depth figure if available
+        if self.has_msa_depth:
+            msa_depth_fig = self.plot_msa_depth()
+            if msa_depth_fig:
+                figures["msa_depth"] = msa_depth_fig
 
         return figures
 
@@ -868,6 +1006,11 @@ class StructureCharacterizer:
                     fig = plot_fn()
                     if fig:
                         pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+            # Add MSA depth plot if available
+            if self.has_msa_depth:
+                fig = self.plot_msa_depth()
+                if fig:
+                    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
             # Add glossary pages
             glossary_figs = self._create_glossary_pages()
             for fig in glossary_figs:
@@ -926,6 +1069,35 @@ class StructureCharacterizer:
                 lines.append(f"pTM Score:          {pae_analysis.pae_data.ptm:.3f}")
             if pae_analysis.pae_data.iptm is not None:
                 lines.append(f"ipTM Score:         {pae_analysis.pae_data.iptm:.3f}")
+
+        # Add Chai scores section if available
+        if self.has_chai_scores:
+            scores = self.chai_scores
+            quality = "High" if scores.ptm >= 0.8 else ("Moderate" if scores.ptm >= 0.5 else "Low")
+            lines.extend([
+                "", "=" * 50, "CHAI PREDICTION SCORES", "=" * 50,
+                f"pTM Score:          {scores.ptm:.3f}",
+                f"ipTM Score:         {scores.iptm:.3f}",
+                f"Aggregate Score:    {scores.aggregate_score:.3f}",
+                f"Quality:            {quality} confidence",
+            ])
+            if scores.is_multimer:
+                lines.append(f"Chains:             {scores.n_chains}")
+            if scores.has_inter_chain_clashes:
+                lines.append(f"Inter-chain Clashes: Yes")
+
+        # Add MSA depth section if available
+        if self.has_msa_depth:
+            msa = self.msa_depth
+            quality = "Excellent" if msa.mean_depth >= 1000 else ("Good" if msa.mean_depth >= 100 else "Limited")
+            lines.extend([
+                "", "=" * 50, "MSA DEPTH ANALYSIS", "=" * 50,
+                f"Mean Depth:         {msa.mean_depth:.0f}",
+                f"Median Depth:       {msa.median_depth:.0f}",
+                f"Max Depth:          {msa.max_depth}",
+                f"Min Depth:          {msa.min_depth}",
+                f"Coverage Quality:   {quality}",
+            ])
 
         lines.extend([
             "", "=" * 50, "CONTACT ANALYSIS", "=" * 50,
@@ -1099,6 +1271,10 @@ class StructureCharacterizer:
 
     {self._build_pae_html_section(pae_analysis, images_b64)}
 
+    {self._build_chai_scores_html_section()}
+
+    {self._build_msa_html_section(images_b64)}
+
     <div class="section" id="glossary">
         <h2>Glossary of Terms</h2>
         <div class="glossary-grid">
@@ -1243,6 +1419,85 @@ class StructureCharacterizer:
         <div class="figure"><img src="data:image/png;base64,{images_b64["pae_heatmap"]}" alt="PAE Heatmap"><div class="figure-caption">Predicted Aligned Error matrix (green = low error, white = high error)</div></div>
         {pae_domains_html}
         {pae_per_residue_html}
+    </div>
+'''
+
+    def _build_chai_scores_html_section(self) -> str:
+        """Build HTML for Chai scores section if Chai scores are available."""
+        if not self.has_chai_scores:
+            return ""  # No Chai scores section if no data
+
+        scores = self.chai_scores
+
+        # Determine quality assessment
+        if scores.ptm >= 0.8:
+            ptm_class = "highlight"
+            quality = "High confidence prediction"
+        elif scores.ptm >= 0.5:
+            ptm_class = ""
+            quality = "Moderate confidence prediction"
+        else:
+            ptm_class = "warning"
+            quality = "Low confidence prediction"
+
+        # ipTM metric (relevant for multimers)
+        iptm_html = ""
+        if scores.is_multimer or scores.iptm > 0:
+            iptm_html = f'''<div class="metric-box"><div class="metric-value">{scores.iptm:.3f}</div><div class="metric-label">ipTM Score</div></div>'''
+
+        # Clash detection
+        clash_html = ""
+        if scores.has_inter_chain_clashes:
+            clash_html = '''<div class="metric-box warning"><div class="metric-value">Yes</div><div class="metric-label">Inter-chain Clashes</div></div>'''
+
+        # Chains info for multimers
+        chains_html = ""
+        if scores.is_multimer:
+            chains_html = f'''<div class="metric-box"><div class="metric-value">{scores.n_chains}</div><div class="metric-label">Chains</div></div>'''
+
+        return f'''
+    <div class="section" id="chai-scores"><h2>Chai Prediction Scores</h2>
+        <p style="color: #666; margin-bottom: 15px;">Chai confidence metrics assess the quality of the structure prediction. pTM (predicted TM-score) measures overall fold confidence, while ipTM assesses interface quality in multimers.</p>
+        <div class="metrics-grid">
+            <div class="metric-box {ptm_class}"><div class="metric-value">{scores.ptm:.3f}</div><div class="metric-label">pTM Score</div></div>
+            {iptm_html}
+            <div class="metric-box"><div class="metric-value">{scores.aggregate_score:.3f}</div><div class="metric-label">Aggregate Score</div></div>
+            {chains_html}
+            {clash_html}
+        </div>
+        <p style="color: #555; font-style: italic; margin-top: 15px;">Quality assessment: {quality}</p>
+    </div>
+'''
+
+    def _build_msa_html_section(self, images_b64: dict) -> str:
+        """Build HTML for MSA depth section if MSA data is available."""
+        if not self.has_msa_depth or "msa_depth" not in images_b64:
+            return ""  # No MSA section if no data
+
+        msa = self.msa_depth
+
+        # Assess MSA quality
+        if msa.mean_depth >= 1000:
+            depth_class = "highlight"
+            quality = "Excellent MSA coverage"
+        elif msa.mean_depth >= 100:
+            depth_class = ""
+            quality = "Good MSA coverage"
+        else:
+            depth_class = "warning"
+            quality = "Limited MSA coverage - predictions may be less reliable"
+
+        return f'''
+    <div class="section" id="msa-depth"><h2>MSA Depth Analysis</h2>
+        <p style="color: #666; margin-bottom: 15px;">Multiple Sequence Alignment (MSA) depth indicates the number of homologous sequences aligned at each position. Higher depth generally correlates with better prediction quality.</p>
+        <div class="metrics-grid">
+            <div class="metric-box {depth_class}"><div class="metric-value">{msa.mean_depth:.0f}</div><div class="metric-label">Mean Depth</div></div>
+            <div class="metric-box"><div class="metric-value">{msa.median_depth:.0f}</div><div class="metric-label">Median Depth</div></div>
+            <div class="metric-box"><div class="metric-value">{msa.max_depth}</div><div class="metric-label">Max Depth</div></div>
+            <div class="metric-box"><div class="metric-value">{msa.min_depth}</div><div class="metric-label">Min Depth</div></div>
+        </div>
+        <div class="figure"><img src="data:image/png;base64,{images_b64["msa_depth"]}" alt="MSA Depth"><div class="figure-caption">MSA depth per residue position</div></div>
+        <p style="color: #555; font-style: italic; margin-top: 15px;">{quality}</p>
     </div>
 '''
 

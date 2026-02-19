@@ -458,7 +458,11 @@ def report(results_csv, output, fmt, min_tm, max_rmsd):
               help="Treat as predicted structure (pLDDT confidence scores)")
 @click.option("--pae", "pae_path", type=click.Path(exists=True), default=None,
               help="Path to PAE JSON file (AlphaFold predicted aligned error)")
-def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, is_predicted, pae_path):
+@click.option("--chai-scores", "chai_scores_path", type=click.Path(exists=True), default=None,
+              help="Path to Chai scores NPZ file (scores.model_idx_*.npz)")
+@click.option("--msa", "msa_path", type=click.Path(exists=True), default=None,
+              help="Path to MSA parquet file (Chai .aligned.pqt, requires pyarrow)")
+def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, is_predicted, pae_path, chai_scores_path, msa_path):
     """Generate comprehensive characterization report for a structure.
 
     Analyzes confidence scores, contacts, secondary structure, and
@@ -469,6 +473,10 @@ def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, i
 
     For AlphaFold structures, use --pae to provide the PAE JSON file for
     domain analysis and confidence visualization.
+
+    For Chai structures, use --chai-scores to provide the scores NPZ file
+    for pTM/ipTM display. Use --msa to provide MSA parquet files for
+    MSA depth visualization (requires pyarrow).
 
     Examples:
 
@@ -481,6 +489,10 @@ def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, i
         protein_compare characterize alphafold.pdb --predicted --dpi 300
 
         protein_compare characterize alphafold.pdb --pae alphafold_scores.json
+
+        protein_compare characterize chai.cif --chai-scores scores.model_idx_0.npz
+
+        protein_compare characterize chai.cif --chai-scores scores.npz --msa msas/seq.aligned.pqt
     """
     click.echo("Loading structure...")
 
@@ -509,6 +521,8 @@ def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, i
         dpi=dpi,
         structure_type=structure_type,
         pae_path=pae_path,
+        chai_scores_path=chai_scores_path,
+        msa_path=msa_path,
     )
 
     # Show structure info with appropriate terminology
@@ -520,6 +534,12 @@ def characterize(structure, output, fmt, contact_cutoff, dpi, is_experimental, i
             click.echo(f"  PAE loaded: mean {pae_analysis.mean_pae:.1f} Å, {pae_analysis.n_domains} domain(s) detected")
             if pae_analysis.pae_data.ptm is not None:
                 click.echo(f"  pTM: {pae_analysis.pae_data.ptm:.3f}")
+        if characterizer.has_chai_scores:
+            scores = characterizer.chai_scores
+            click.echo(f"  Chai scores loaded: pTM={scores.ptm:.3f}, ipTM={scores.iptm:.3f}")
+        if characterizer.has_msa_depth:
+            msa = characterizer.msa_depth
+            click.echo(f"  MSA depth loaded: mean={msa.mean_depth:.0f}, max={msa.max_depth}")
     else:
         click.echo(f"  {struct.name}: {struct.n_residues} residues, mean B-factor: {struct.mean_plddt:.1f} Ų")
         click.echo(f"  Structure type: Experimental (B-factor flexibility)")
