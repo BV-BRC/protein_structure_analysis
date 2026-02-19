@@ -837,10 +837,14 @@ class StructureCharacterizer:
         for fig in figures.values():
             plt.close(fig)
         # Read PDB content for 3D viewer
-        pdb_content = ""
+        structure_content = ""
+        structure_format = "pdb"
         if self.structure.source_path and self.structure.source_path.exists():
-            pdb_content = self.structure.source_path.read_text()
-        html = self._build_html(seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, pdb_content, pae_analysis)
+            structure_content = self.structure.source_path.read_text()
+            suffix = self.structure.source_path.suffix.lower()
+            if suffix in (".cif", ".mmcif"):
+                structure_format = "cif"
+        html = self._build_html(seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, structure_content, pae_analysis, structure_format)
         Path(output_path).write_text(html)
 
     def generate_pdf_report(self, output_path: str) -> None:
@@ -941,10 +945,10 @@ class StructureCharacterizer:
         ax.text(0.1, 0.85, "\n".join(lines), fontsize=10, ha="left", va="top", family="monospace", transform=ax.transAxes)
         return fig
 
-    def _build_html(self, seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, pdb_content="", pae_analysis=None) -> str:
+    def _build_html(self, seq_comp, conf_stats, contact_analysis, ss_analysis, images_b64, structure_content="", pae_analysis=None, structure_format="pdb") -> str:
         """Build HTML report string."""
-        # Escape PDB content for JavaScript
-        pdb_escaped = pdb_content.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$") if pdb_content else ""
+        # Escape structure content for JavaScript
+        structure_escaped = structure_content.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$") if structure_content else ""
 
         # Structure-type-specific labels and thresholds
         if self.is_predicted:
@@ -1109,19 +1113,20 @@ class StructureCharacterizer:
         let currentStyle = 'cartoon';
         let currentColor = 'ss';
 
-        const pdbData = `{pdb_escaped}`;
+        const structureData = `{structure_escaped}`;
+        const structureFormat = '{structure_format}';
 
         document.addEventListener('DOMContentLoaded', function() {{
-            if (pdbData.trim()) {{
+            if (structureData.trim()) {{
                 let element = document.getElementById('viewer');
                 let config = {{ backgroundColor: 'white' }};
                 viewer = $3Dmol.createViewer(element, config);
-                viewer.addModel(pdbData, 'pdb');
+                viewer.addModel(structureData, structureFormat);
                 applyStyle();
                 viewer.zoomTo();
                 viewer.render();
             }} else {{
-                document.getElementById('viewer-container').innerHTML = '<p style="text-align:center;padding:50px;color:#999;">PDB data not available</p>';
+                document.getElementById('viewer-container').innerHTML = '<p style="text-align:center;padding:50px;color:#999;">Structure data not available</p>';
             }}
         }});
 

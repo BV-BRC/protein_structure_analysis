@@ -1,6 +1,6 @@
-"""PDB file parsing with confidence score extraction.
+"""PDB and mmCIF file parsing with confidence score extraction.
 
-Handles PDB files from AlphaFold, ESMFold, Chai, and Boltz,
+Handles PDB and mmCIF files from AlphaFold, ESMFold, Chai, and Boltz,
 extracting pLDDT confidence scores from the B-factor column.
 """
 
@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from Bio.PDB import PDBParser, Structure
+from Bio.PDB import PDBParser, MMCIFParser, Structure
 from Bio.PDB.Chain import Chain
 from Bio.PDB.Residue import Residue
 
@@ -109,6 +109,94 @@ class PAEData:
 
 
 @dataclass
+class ChaiScores:
+    """Container for Chai prediction confidence scores.
+
+    Chai outputs scores in NPZ format containing pTM, ipTM, and
+    per-chain metrics for structure quality assessment.
+    """
+
+    aggregate_score: float  # Combined ranking score
+    ptm: float  # Predicted TM-score (0-1)
+    iptm: float  # Interface pTM (0-1, relevant for multimers)
+    per_chain_ptm: np.ndarray  # Per-chain pTM values, shape (n_chains,)
+    per_chain_pair_iptm: np.ndarray  # Pairwise chain ipTM, shape (n_chains, n_chains)
+    has_inter_chain_clashes: bool  # Whether inter-chain clashes detected
+    chain_chain_clashes: np.ndarray  # Clash counts between chain pairs
+    source_path: Optional[Path] = None
+
+    @property
+    def n_chains(self) -> int:
+        """Number of chains in the prediction."""
+        if self.per_chain_ptm.ndim == 0:
+            return 1
+        return len(self.per_chain_ptm)
+
+    @property
+    def is_multimer(self) -> bool:
+        """Whether this is a multimer prediction."""
+        return self.n_chains > 1
+
+
+class ChaiScoresLoader:
+    """Load Chai prediction scores from NPZ files."""
+
+    def load(self, path: str | Path) -> ChaiScores:
+        """Load Chai scores from NPZ file.
+
+        Args:
+            path: Path to scores.model_idx_*.npz file.
+
+        Returns:
+            ChaiScores object with confidence metrics.
+
+        Raises:
+            FileNotFoundError: If NPZ file doesn't exist.
+            ValueError: If file format is invalid.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Chai scores file not found: {path}")
+
+        try:
+            data = np.load(path)
+        except Exception as e:
+            raise ValueError(f"Failed to load NPZ file {path}: {e}")
+
+        required_keys = {"aggregate_score", "ptm", "iptm", "per_chain_ptm",
+                         "per_chain_pair_iptm", "has_inter_chain_clashes",
+                         "chain_chain_clashes"}
+        missing = required_keys - set(data.keys())
+        if missing:
+            raise ValueError(f"Missing keys in Chai scores file: {missing}")
+
+        return ChaiScores(
+            aggregate_score=float(data["aggregate_score"].flat[0]),
+            ptm=float(data["ptm"].flat[0]),
+            iptm=float(data["iptm"].flat[0]),
+            per_chain_ptm=data["per_chain_ptm"].squeeze(),
+            per_chain_pair_iptm=data["per_chain_pair_iptm"].squeeze(),
+            has_inter_chain_clashes=bool(data["has_inter_chain_clashes"].flat[0]),
+            chain_chain_clashes=data["chain_chain_clashes"].squeeze(),
+            source_path=path,
+        )
+
+    def load_all_models(self, output_dir: str | Path) -> list[ChaiScores]:
+        """Load scores for all models in a Chai output directory.
+
+        Args:
+            output_dir: Path to Chai output directory containing
+                        scores.model_idx_*.npz files.
+
+        Returns:
+            List of ChaiScores, one per model, sorted by model index.
+        """
+        output_dir = Path(output_dir)
+        score_files = sorted(output_dir.glob("scores.model_idx_*.npz"))
+        return [self.load(f) for f in score_files]
+
+
+@dataclass
 class ProteinStructure:
     """Container for protein structure data with confidence scores."""
 
@@ -143,7 +231,7 @@ class ProteinStructure:
 
 
 class StructureLoader:
-    """Load and parse PDB files with pLDDT extraction."""
+    """Load and parse PDB and mmCIF files with pLDDT extraction."""
 
     # Standard amino acid 3-letter to 1-letter mapping
     AA_MAP = {
@@ -162,26 +250,43 @@ class StructureLoader:
         Args:
             quiet: Suppress BioPython parser warnings.
         """
-        self.parser = PDBParser(QUIET=quiet)
+        self.pdb_parser = PDBParser(QUIET=quiet)
+        self.cif_parser = MMCIFParser(QUIET=quiet)
 
-    def load(self, path: str | Path) -> ProteinStructure:
-        """Load a PDB file and extract structure data.
+    def _get_parser(self, path: Path):
+        """Get appropriate parser based on file extension.
 
         Args:
-            path: Path to PDB file.
+            path: Path to structure file.
+
+        Returns:
+            PDBParser or MMCIFParser instance.
+        """
+        suffix = path.suffix.lower()
+        if suffix in (".cif", ".mmcif"):
+            return self.cif_parser
+        else:
+            return self.pdb_parser
+
+    def load(self, path: str | Path) -> ProteinStructure:
+        """Load a PDB or mmCIF file and extract structure data.
+
+        Args:
+            path: Path to PDB or mmCIF file.
 
         Returns:
             ProteinStructure with coordinates and confidence scores.
 
         Raises:
-            FileNotFoundError: If PDB file doesn't exist.
+            FileNotFoundError: If structure file doesn't exist.
             ValueError: If no valid residues found.
         """
         path = Path(path)
         if not path.exists():
-            raise FileNotFoundError(f"PDB file not found: {path}")
+            raise FileNotFoundError(f"Structure file not found: {path}")
 
-        structure = self.parser.get_structure(path.stem, str(path))
+        parser = self._get_parser(path)
+        structure = parser.get_structure(path.stem, str(path))
 
         ca_coords = []
         cb_coords = []
